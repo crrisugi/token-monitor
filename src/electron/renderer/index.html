@@ -1664,6 +1664,12 @@
         <input type="date" id="customPeriodStartDate" class="custom-period-input" aria-label="Start date" data-i18n-aria-label="periodRange.startDate">
         <span class="custom-period-sep" aria-hidden="true">–</span>
         <input type="date" id="customPeriodEndDate" class="custom-period-input" aria-label="End date" data-i18n-aria-label="periodRange.endDate">
+        <div class="custom-period-account-row">
+          <select id="customPeriodAccountSelect" class="custom-period-select" aria-label="Antigravity account" data-i18n-aria-label="antigravity.accountFilter.label"><option value="all" data-i18n="antigravity.accountFilter.all">All Antigravity accounts</option><option value="unattributed" data-i18n="antigravity.accountFilter.unattributed">Unattributed (historical)</option></select>
+          <button id="customPeriodAssignBtn" type="button" class="custom-period-btn" data-i18n="antigravity.assignRange.button">Assign range</button>
+          <button id="customPeriodClearAssignBtn" type="button" class="custom-period-btn hidden" data-i18n="antigravity.assignRange.clear">Clear</button>
+          <div id="customPeriodAccountSummary" class="custom-period-account-summary hidden"></div>
+        </div>
       </div>
 
       <section id="fixedPeriodMessage" class="fixed-period-message hidden" role="status" aria-live="polite"></section>

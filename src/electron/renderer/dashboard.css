@@ -176,3 +176,126 @@ html.native-high-contrast .dash-cards { border-color: var(--line-strong); }
 }
 
 .dash-card-v .usage-cost-info { margin-inline-start: 3px; }
+
+.dash-overview-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.control-select {
+  background: rgba(var(--overlay-rgb), 0.06);
+  border: 1px solid rgba(var(--overlay-rgb), 0.12);
+  border-radius: 6px;
+  color: inherit;
+  font-family: inherit;
+  font-size: 11px;
+  padding: 4px 8px;
+  outline: none;
+  color-scheme: dark light;
+}
+.control-select:focus {
+  border-color: rgba(var(--overlay-rgb), 0.3);
+}
+.dash-account-section {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-top: 8px;
+}
+.dash-section-title {
+  font-size: 12px;
+  font-weight: 600;
+  opacity: 0.6;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin: 0;
+}
+.dash-account-table {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border: 1px solid rgba(var(--overlay-rgb), 0.08);
+  border-radius: 10px;
+  padding: 10px 14px;
+  background: rgba(var(--overlay-rgb), 0.03);
+}
+.dash-account-row {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 6px 0;
+  border-bottom: 1px solid rgba(var(--overlay-rgb), 0.06);
+}
+.dash-account-row:last-child {
+  border-bottom: none;
+}
+.dash-account-main {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+}
+.dash-account-identity {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dash-account-email {
+  opacity: 0.6;
+  font-size: 11px;
+}
+.dash-account-badge {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: rgba(var(--overlay-rgb), 0.08);
+  opacity: 0.8;
+}
+.dash-account-stats {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+}
+.dash-account-tokens {
+  font-weight: 600;
+}
+.dash-account-components {
+  font-size: 11px;
+  opacity: 0.55;
+}
+.dash-account-cost {
+  opacity: 0.85;
+}
+.dash-account-pct {
+  opacity: 0.55;
+  min-width: 40px;
+  text-align: right;
+}
+.dash-account-models {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  font-size: 11px;
+  opacity: 0.7;
+  padding-left: 2px;
+}
+.dash-account-model-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.dash-model-name {
+  opacity: 0.8;
+}
+.dash-model-tokens {
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+}

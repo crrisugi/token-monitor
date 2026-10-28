@@ -29,6 +29,11 @@ const els = {
   dashCustomRangeBar: document.getElementById('dashCustomRangeBar'),
   dashCustomStart: document.getElementById('dashCustomStart'),
   dashCustomEnd: document.getElementById('dashCustomEnd'),
+  dashAntigravityAccountSelect: document.getElementById('dashAntigravityAccountSelect'),
+  dashAssignAccountRangeBtn: document.getElementById('dashAssignAccountRangeBtn'),
+  dashClearAccountRangeBtn: document.getElementById('dashClearAccountRangeBtn'),
+  dashAntigravityAccountSection: document.getElementById('dashAntigravityAccountSection'),
+  dashAntigravityAccountTable: document.getElementById('dashAntigravityAccountTable'),
   chart: document.getElementById('dashChart'),
   legend: document.getElementById('dashLegend'),
   heatmap: document.getElementById('dashHeatmap'),
@@ -45,7 +50,8 @@ const state = {
   tab: 'activity', range: '30', stackBy: 'client', mode: 'bars', flat: false,
   locale: 'en', currency: 'USD', compactTokenUnits: 'western', history: null, chartModel: null,
   chartKind: 'bars', motion: 'none', reduceMotion: 'system',
-  heatmapMetric: 'cost', customStart: '', customEnd: ''
+  heatmapMetric: 'cost', customStart: '', customEnd: '',
+  antigravityAccountFilter: 'all', antigravityPayload: null, antigravityLedger: null
 };
 let nativeMaterialState = glassRenderingApi?.normalizeNativeMaterialState?.() || { type: 'transparent', reducedTransparency: false, highContrast: false };
 let nativeMaterialRevision = 0;
@@ -333,17 +339,97 @@ function getEffectiveRange() {
   return { start, end };
 }
 
+function escapeHtml(str) {
+  return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function attributeDay(dayStr, ledger) {
+  const dateStr = dayStr ? String(dayStr).slice(0, 10) : '';
+  if (!dateStr || !ledger) {
+    return { email: 'unattributed', source: 'unattributed', isUnattributed: true };
+  }
+  if (Array.isArray(ledger.dateRangeAssignments)) {
+    for (let i = ledger.dateRangeAssignments.length - 1; i >= 0; i -= 1) {
+      const assignment = ledger.dateRangeAssignments[i];
+      let start = String(assignment.startDate).slice(0, 10);
+      let end = String(assignment.endDate).slice(0, 10);
+      if (start > end) [start, end] = [end, start];
+      if (dateStr >= start && dateStr <= end) {
+        return { email: (assignment.email || '').trim().toLowerCase() || 'unattributed', source: 'date_range', isUnattributed: false };
+      }
+    }
+  }
+  if (Array.isArray(ledger.timeline)) {
+    for (let i = ledger.timeline.length - 1; i >= 0; i -= 1) {
+      const interval = ledger.timeline[i];
+      const startDay = interval.startedAt ? String(interval.startedAt).slice(0, 10) : '';
+      const endDay = interval.endedAt ? String(interval.endedAt).slice(0, 10) : '';
+      if (startDay <= dateStr && (!endDay || dateStr <= endDay)) {
+        return { email: (interval.email || '').trim().toLowerCase() || 'unattributed', source: interval.source || 'timeline', isUnattributed: false };
+      }
+    }
+  }
+  return { email: 'unattributed', source: 'unattributed', isUnattributed: true };
+}
+
+function getActiveDateRange() {
+  if (state.range === 'custom') {
+    return getEffectiveRange();
+  }
+  const allDaily = state.history?.daily || [];
+  const clamped = charts.clampDaily(allDaily, state.range === 'all' ? 0 : Number(state.range));
+  if (clamped.length > 0) {
+    return {
+      start: String(clamped[0].date).slice(0, 10),
+      end: String(clamped[clamped.length - 1].date).slice(0, 10)
+    };
+  }
+  return null;
+}
+
+function applyAntigravityAccountFilter(dailyList) {
+  const filter = (state.antigravityAccountFilter || 'all').trim().toLowerCase();
+  if (filter === 'all' || !state.antigravityLedger || !Array.isArray(dailyList)) {
+    return dailyList;
+  }
+  return dailyList.map((d) => {
+    const dateStr = String(d.date || '').slice(0, 10);
+    const attr = attributeDay(dateStr, state.antigravityLedger);
+    if (attr.email === filter) {
+      return d;
+    }
+    const agClient = d.perClient?.antigravity || d.perClient?.['antigravity-cli'];
+    if (!agClient) return d;
+    const agTokens = Number(agClient.tokens || 0);
+    const agCost = Number(agClient.cost || 0);
+    const nextPerClient = { ...d.perClient };
+    delete nextPerClient.antigravity;
+    delete nextPerClient['antigravity-cli'];
+    return {
+      ...d,
+      tokens: Math.max(0, Number(d.tokens || 0) - agTokens),
+      cost: Math.max(0, Number(d.cost || 0) - agCost),
+      perClient: nextPerClient
+    };
+  });
+}
+
 function getFilteredDaily() {
   const allDaily = state.history?.daily || [];
+  let daily;
   if (state.range === 'custom') {
     const r = getEffectiveRange();
-    if (!r) return allDaily;
-    return allDaily.filter((d) => {
-      const date = String(d.date || '').slice(0, 10);
-      return date >= r.start && date <= r.end;
-    });
+    if (!r) daily = allDaily;
+    else {
+      daily = allDaily.filter((d) => {
+        const date = String(d.date || '').slice(0, 10);
+        return date >= r.start && date <= r.end;
+      });
+    }
+  } else {
+    daily = charts.clampDaily(allDaily, state.range === 'all' ? 0 : Number(state.range));
   }
-  return charts.clampDaily(allDaily, state.range === 'all' ? 0 : Number(state.range));
+  return applyAntigravityAccountFilter(daily);
 }
 
 function onDashCustomDateChange() {
@@ -353,7 +439,7 @@ function onDashCustomDateChange() {
     state.customEnd = r.end;
   }
   state.motion = 'update';
-  render();
+  void refresh();
 }
 
 let dashCustomInputsWired = false;
@@ -362,6 +448,141 @@ function wireCustomRangeInputs() {
   dashCustomInputsWired = true;
   if (els.dashCustomStart) els.dashCustomStart.addEventListener('change', onDashCustomDateChange);
   if (els.dashCustomEnd) els.dashCustomEnd.addEventListener('change', onDashCustomDateChange);
+  if (els.dashAntigravityAccountSelect) {
+    els.dashAntigravityAccountSelect.addEventListener('change', () => {
+      state.antigravityAccountFilter = els.dashAntigravityAccountSelect.value;
+      void refresh();
+    });
+  }
+  if (els.dashAssignAccountRangeBtn) {
+    els.dashAssignAccountRangeBtn.addEventListener('click', async () => {
+      const currentRange = getEffectiveRange();
+      const email = els.dashAntigravityAccountSelect?.value;
+      if (!currentRange || !email || email === 'all' || email === 'unattributed') return;
+      try {
+        await window.tokenMonitor?.antigravity?.assignDateRange?.({
+          startDate: currentRange.start,
+          endDate: currentRange.end,
+          email
+        });
+        await refresh();
+      } catch (_) {}
+    });
+  }
+  if (els.dashClearAccountRangeBtn) {
+    els.dashClearAccountRangeBtn.addEventListener('click', async () => {
+      const currentRange = getEffectiveRange();
+      const email = els.dashAntigravityAccountSelect?.value;
+      if (!currentRange) return;
+      try {
+        await window.tokenMonitor?.antigravity?.removeDateRange?.({
+          startDate: currentRange.start,
+          endDate: currentRange.end,
+          email: (email && email !== 'all' && email !== 'unattributed') ? email : undefined
+        });
+        await refresh();
+      } catch (_) {}
+    });
+  }
+}
+
+function renderAntigravityAccountTable() {
+  if (!els.dashAntigravityAccountSection || !els.dashAntigravityAccountTable) return;
+  const payload = state.antigravityPayload;
+  if (!payload || !payload.summary) {
+    els.dashAntigravityAccountSection.classList.add('hidden');
+    return;
+  }
+
+  if (els.dashAntigravityAccountSelect && Array.isArray(payload.discoveredAccounts)) {
+    const currentVal = state.antigravityAccountFilter || els.dashAntigravityAccountSelect.value || 'all';
+    const existingEmails = new Set();
+    while (els.dashAntigravityAccountSelect.options.length > 2) {
+      els.dashAntigravityAccountSelect.remove(2);
+    }
+    for (const acc of payload.discoveredAccounts) {
+      const email = (acc.email || '').trim().toLowerCase();
+      if (!email || existingEmails.has(email)) continue;
+      existingEmails.add(email);
+      const opt = document.createElement('option');
+      opt.value = email;
+      opt.textContent = (acc.displayName && acc.displayName !== email)
+        ? `${email} (${acc.displayName})`
+        : email;
+      els.dashAntigravityAccountSelect.appendChild(opt);
+    }
+    if (currentVal && Array.from(els.dashAntigravityAccountSelect.options).some((o) => o.value === currentVal)) {
+      els.dashAntigravityAccountSelect.value = currentVal;
+    }
+  }
+
+  const isCustom = state.range === 'custom';
+  const filter = (state.antigravityAccountFilter || 'all').trim().toLowerCase();
+  const isNamedAccount = filter !== 'all' && filter !== 'unattributed';
+  const currentRange = getEffectiveRange();
+  const assignments = payload.ledger?.dateRangeAssignments || [];
+  const hasMatchingAssignment = currentRange && assignments.some((a) => {
+    let aStart = a.startDate;
+    let aEnd = a.endDate;
+    if (aStart > aEnd) [aStart, aEnd] = [aEnd, aStart];
+    return aStart === currentRange.start && aEnd === currentRange.end && (!isNamedAccount || a.email === filter);
+  });
+
+  if (els.dashAssignAccountRangeBtn) {
+    els.dashAssignAccountRangeBtn.classList.toggle('hidden', !(isCustom && isNamedAccount));
+  }
+  if (els.dashClearAccountRangeBtn) {
+    els.dashClearAccountRangeBtn.classList.toggle('hidden', !(isCustom && hasMatchingAssignment));
+  }
+
+  const accounts = payload.summary?.accounts || [];
+  const overallTokens = Number(payload.summary?.overallTotalTokens || payload.summary?.totalTokens || 0);
+
+  if (accounts.length === 0 && overallTokens === 0) {
+    els.dashAntigravityAccountSection.classList.add('hidden');
+    return;
+  }
+
+  els.dashAntigravityAccountSection.classList.remove('hidden');
+
+  let rowsHtml = '';
+  for (const acc of accounts) {
+    const email = acc.email;
+    const displayName = acc.displayName || email;
+    const assignedRanges = (payload.ledger?.dateRangeAssignments || [])
+      .filter((a) => a.email === email)
+      .map((a) => `${a.startDate} – ${a.endDate}`)
+      .join(', ');
+
+    const modelsList = Object.entries(acc.models || {})
+      .filter(([, m]) => Number(m.tokens || 0) > 0)
+      .sort((a, b) => b[1].tokens - a[1].tokens);
+
+    const modelBadgesHtml = modelsList.map(([modelId, m]) => {
+      return `<span class="dash-account-model-item"><span class="dash-model-name">${escapeHtml(modelId)}:</span> <span class="dash-model-tokens">${formatCompact(m.tokens)}</span> (${formatCostCompact(m.costUsd)})</span>`;
+    }).join('');
+
+    rowsHtml += `
+      <div class="dash-account-row">
+        <div class="dash-account-main">
+          <div class="dash-account-identity">
+            <strong>${escapeHtml(displayName)}</strong>
+            ${email !== displayName && email !== 'unattributed' ? `<span class="dash-account-email">(${escapeHtml(email)})</span>` : ''}
+            ${assignedRanges ? `<span class="dash-account-badge">${escapeHtml(assignedRanges)}</span>` : ''}
+          </div>
+          <div class="dash-account-stats">
+            <span class="dash-account-tokens" title="${t('antigravity.summary.tokens')}">${formatCompact(acc.totalTokens)}</span>
+            <span class="dash-account-components" title="In / Out / Cache">(${formatCompact(acc.inputTokens)} in / ${formatCompact(acc.outputTokens)} out / ${formatCompact(acc.cacheReadTokens)} cache)</span>
+            <span class="dash-account-cost" title="${t('antigravity.summary.cost')}">${formatCostCompact(acc.costUsd)}</span>
+            <span class="dash-account-pct" title="${t('antigravity.summary.share')}">${acc.percentageOfTotal}%</span>
+          </div>
+        </div>
+        ${modelBadgesHtml ? `<div class="dash-account-models">${modelBadgesHtml}</div>` : ''}
+      </div>
+    `;
+  }
+
+  els.dashAntigravityAccountTable.innerHTML = rowsHtml;
 }
 
 function summaryForDaily(daily) {
@@ -621,7 +842,7 @@ function balanceStatCards() {
 function renderActivity() {
   const filtered = getFilteredDaily();
   const allDaily = charts.computeHeatmapIntensities(state.history?.daily || []);
-  const daily = state.range === 'all' ? allDaily : filtered;
+  const daily = state.range === 'all' ? applyAntigravityAccountFilter(allDaily) : filtered;
   let end = todayKey();
   const now = new Date(`${end}T00:00:00Z`);
   let start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 11, 1)).toISOString().slice(0, 10);
@@ -672,6 +893,7 @@ function renderActivity() {
   }
   balanceStatCards();
   renderBreakdown();
+  renderAntigravityAccountTable();
 }
 
 function renderNow() {
@@ -783,7 +1005,22 @@ async function refresh() {
   refreshRunning = true;
   try {
     state.motion = state.history ? 'update' : 'entry';
-    state.history = await window.tokenMonitor.getDashboardHistory();
+    const activeRange = typeof getActiveDateRange === 'function' ? getActiveDateRange() : null;
+    const agPromise = (typeof window !== 'undefined' && window.tokenMonitor?.antigravity?.getAccountUsageSummary)
+      ? window.tokenMonitor.antigravity.getAccountUsageSummary({
+          range: activeRange,
+          accountFilter: state.antigravityAccountFilter || 'all'
+        }).catch(() => null)
+      : null;
+    const history = await window.tokenMonitor.getDashboardHistory();
+    state.history = history;
+    if (agPromise) {
+      const antigravityPayload = await agPromise;
+      if (antigravityPayload) {
+        state.antigravityPayload = antigravityPayload;
+        state.antigravityLedger = antigravityPayload.ledger;
+      }
+    }
     render();
   } catch (error) {
     state.motion = 'none';
@@ -829,6 +1066,7 @@ async function boot() {
   applyAppearance(settings);
   applyTranslations();
   populateRangeSelect();
+  wireCustomRangeInputs();
   render();
   await refresh();
   dashboardReady = true;

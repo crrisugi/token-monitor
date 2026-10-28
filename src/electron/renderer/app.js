@@ -409,6 +409,10 @@ Object.assign(els, {
   customPeriodBar: document.getElementById('customPeriodBar'),
   customPeriodStartDate: document.getElementById('customPeriodStartDate'),
   customPeriodEndDate: document.getElementById('customPeriodEndDate'),
+  customPeriodAccountSelect: document.getElementById('customPeriodAccountSelect'),
+  customPeriodAssignBtn: document.getElementById('customPeriodAssignBtn'),
+  customPeriodClearAssignBtn: document.getElementById('customPeriodClearAssignBtn'),
+  customPeriodAccountSummary: document.getElementById('customPeriodAccountSummary'),
   modelRankingMetricInputs: Array.from(document.querySelectorAll('input[name="modelRankingMetric"]'))
 });
 Object.assign(els, {
@@ -9340,6 +9344,7 @@ function syncPeriodTabs() {
       if (els.customPeriodEndDate && document.activeElement !== els.customPeriodEndDate && !els.customPeriodEndDate.value) {
         els.customPeriodEndDate.value = end;
       }
+      void syncAntigravityCustomPeriodSummary();
     }
   }
   syncPeriodMenu();
@@ -13356,8 +13361,139 @@ async function onCustomPeriodDateChange() {
   await saveSettings({ customPeriodStart: start, customPeriodEnd: end });
 }
 
-els.customPeriodStartDate?.addEventListener('change', onCustomPeriodDateChange);
-els.customPeriodEndDate?.addEventListener('change', onCustomPeriodDateChange);
+els.customPeriodStartDate?.addEventListener('change', () => {
+  onCustomPeriodDateChange();
+  void syncAntigravityCustomPeriodSummary();
+});
+els.customPeriodEndDate?.addEventListener('change', () => {
+  onCustomPeriodDateChange();
+  void syncAntigravityCustomPeriodSummary();
+});
+
+let antigravityCustomSummaryLoading = false;
+async function syncAntigravityCustomPeriodSummary() {
+  if (state.period !== 'custom' || !els.customPeriodBar) return;
+  if (!window.tokenMonitor?.antigravity?.getAccountUsageSummary) return;
+
+  const currentRange = state.fixedPeriodSnapshot?.range || state.customPeriodRange || {};
+  const today = fixedPeriodRangesApi.localDayKey();
+  const start = currentRange.start || state.settings?.customPeriodStart || today;
+  const end = currentRange.end || state.settings?.customPeriodEnd || today;
+  const accountFilter = els.customPeriodAccountSelect?.value || 'all';
+
+  if (antigravityCustomSummaryLoading) return;
+  antigravityCustomSummaryLoading = true;
+  try {
+    const payload = await window.tokenMonitor.antigravity.getAccountUsageSummary({
+      range: { start, end },
+      accountFilter
+    });
+    if (!payload) return;
+
+    if (els.customPeriodAccountSelect && Array.isArray(payload.discoveredAccounts)) {
+      const currentVal = els.customPeriodAccountSelect.value;
+      const existingEmails = new Set();
+      while (els.customPeriodAccountSelect.options.length > 2) {
+        els.customPeriodAccountSelect.remove(2);
+      }
+      for (const acc of payload.discoveredAccounts) {
+        const email = (acc.email || '').trim().toLowerCase();
+        if (!email || existingEmails.has(email)) continue;
+        existingEmails.add(email);
+        const opt = document.createElement('option');
+        opt.value = email;
+        opt.textContent = (acc.displayName && acc.displayName !== email)
+          ? `${email} (${acc.displayName})`
+          : email;
+        els.customPeriodAccountSelect.appendChild(opt);
+      }
+      if (currentVal && Array.from(els.customPeriodAccountSelect.options).some((o) => o.value === currentVal)) {
+        els.customPeriodAccountSelect.value = currentVal;
+      }
+    }
+
+    const selectedEmail = els.customPeriodAccountSelect?.value;
+    const isNamedAccount = selectedEmail && selectedEmail !== 'all' && selectedEmail !== 'unattributed';
+    const assignments = payload.ledger?.dateRangeAssignments || [];
+    const hasMatchingAssignment = assignments.some((a) => {
+      let aStart = a.startDate;
+      let aEnd = a.endDate;
+      if (aStart > aEnd) [aStart, aEnd] = [aEnd, aStart];
+      return aStart === start && aEnd === end && (!isNamedAccount || a.email === selectedEmail);
+    });
+
+    if (els.customPeriodAssignBtn) {
+      els.customPeriodAssignBtn.classList.toggle('hidden', !isNamedAccount);
+    }
+    if (els.customPeriodClearAssignBtn) {
+      els.customPeriodClearAssignBtn.classList.toggle('hidden', !hasMatchingAssignment);
+    }
+
+    if (els.customPeriodAccountSummary) {
+      const summary = payload.summary;
+      const totalTokens = Number(summary?.totalTokens || 0);
+      const costUsd = Number(summary?.costUsd || 0);
+      const models = summary?.models || {};
+      const topModels = Object.entries(models)
+        .filter(([, m]) => Number(m?.tokens || 0) > 0)
+        .sort((a, b) => (b[1].tokens || 0) - (a[1].tokens || 0))
+        .slice(0, 2)
+        .map(([id]) => id)
+        .join(', ');
+
+      if (totalTokens > 0 || (selectedEmail && selectedEmail !== 'all')) {
+        const tokensStr = formatNumber(totalTokens);
+        const costStr = formatCost(costUsd);
+        els.customPeriodAccountSummary.textContent = `${tokensStr} tokens · ${costStr}${topModels ? ' · ' + topModels : ''}`;
+        els.customPeriodAccountSummary.classList.remove('hidden');
+      } else {
+        els.customPeriodAccountSummary.classList.add('hidden');
+      }
+    }
+  } catch (_) {
+  } finally {
+    antigravityCustomSummaryLoading = false;
+  }
+}
+
+els.customPeriodAccountSelect?.addEventListener('change', () => {
+  void syncAntigravityCustomPeriodSummary();
+});
+
+els.customPeriodAssignBtn?.addEventListener('click', async () => {
+  const currentRange = state.fixedPeriodSnapshot?.range || state.customPeriodRange || {};
+  const today = fixedPeriodRangesApi.localDayKey();
+  const start = currentRange.start || state.settings?.customPeriodStart || today;
+  const end = currentRange.end || state.settings?.customPeriodEnd || today;
+  const email = els.customPeriodAccountSelect?.value;
+  if (!email || email === 'all' || email === 'unattributed') return;
+  try {
+    await window.tokenMonitor?.antigravity?.assignDateRange?.({
+      startDate: start,
+      endDate: end,
+      email
+    });
+    await syncAntigravityCustomPeriodSummary();
+    render();
+  } catch (_) {}
+});
+
+els.customPeriodClearAssignBtn?.addEventListener('click', async () => {
+  const currentRange = state.fixedPeriodSnapshot?.range || state.customPeriodRange || {};
+  const today = fixedPeriodRangesApi.localDayKey();
+  const start = currentRange.start || state.settings?.customPeriodStart || today;
+  const end = currentRange.end || state.settings?.customPeriodEnd || today;
+  const email = els.customPeriodAccountSelect?.value;
+  try {
+    await window.tokenMonitor?.antigravity?.removeDateRange?.({
+      startDate: start,
+      endDate: end,
+      email: (email && email !== 'all' && email !== 'unattributed') ? email : undefined
+    });
+    await syncAntigravityCustomPeriodSummary();
+    render();
+  } catch (_) {}
+});
 
 document.addEventListener('click', (event) => {
   if (!state.periodMenuOpen) return;

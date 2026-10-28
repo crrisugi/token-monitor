@@ -29,6 +29,9 @@
         <input type="date" id="dashCustomStart" class="dash-date-input" aria-label="Start date" data-i18n-aria-label="periodRange.startDate">
         <span class="dash-date-sep" aria-hidden="true">–</span>
         <input type="date" id="dashCustomEnd" class="dash-date-input" aria-label="End date" data-i18n-aria-label="periodRange.endDate">
+        <select id="dashAntigravityAccountSelect" class="control-select" aria-label="Antigravity account"><option value="all" data-i18n="antigravity.accountFilter.all">All Antigravity accounts</option><option value="unattributed" data-i18n="antigravity.accountFilter.unattributed">Unattributed (historical)</option></select>
+        <button id="dashAssignAccountRangeBtn" type="button" class="seg-btn hidden" data-i18n="antigravity.assignRange.button">Assign range</button>
+        <button id="dashClearAccountRangeBtn" type="button" class="seg-btn hidden" data-i18n="antigravity.assignRange.clear">Clear</button>
       </div>
     </div>
 
@@ -50,18 +53,24 @@
     </section>
 
     <section id="activityPane" class="dash-pane">
-      <div id="dashCards" class="dash-cards"></div>
-      <div class="dash-heatmap-block">
-        <div class="dash-heatmap-title-row">
-          <div class="dash-heatmap-title" data-i18n="dashboard.heatmap.title">Token Activity</div>
-          <div class="seg seg--sm" data-control="heatmapMetric">
-            <button class="seg-btn" data-val="tokens" aria-pressed="false" data-i18n="dashboard.heatmap.tokens">Tokens</button>
-            <button class="seg-btn active" data-val="cost" aria-pressed="true" data-i18n="dashboard.heatmap.cost">Cost</button>
+      <div id="overviewPanel" class="dash-overview-panel">
+        <div id="dashCards" class="dash-cards"></div>
+        <div class="dash-heatmap-block">
+          <div class="dash-heatmap-title-row">
+            <div class="dash-heatmap-title" data-i18n="dashboard.heatmap.title">Token Activity</div>
+            <div class="seg seg--sm" data-control="heatmapMetric">
+              <button class="seg-btn" data-val="tokens" aria-pressed="false" data-i18n="dashboard.heatmap.tokens">Tokens</button>
+              <button class="seg-btn active" data-val="cost" aria-pressed="true" data-i18n="dashboard.heatmap.cost">Cost</button>
+            </div>
           </div>
+          <div id="dashHeatmap" class="dash-heatmap-wrap"></div>
         </div>
-        <div id="dashHeatmap" class="dash-heatmap-wrap"></div>
+        <div id="dashBreakdown" class="dash-breakdown"></div>
+        <section id="dashAntigravityAccountSection" class="dash-account-section hidden">
+          <h3 class="dash-section-title" data-i18n="antigravity.summary.title">Antigravity Account Usage</h3>
+          <div id="dashAntigravityAccountTable" class="dash-account-table"></div>
+        </section>
       </div>
-      <div id="dashBreakdown" class="dash-breakdown"></div>
     </section>
 
     <div id="dashEmpty" class="dash-empty hidden" data-i18n="dashboard.empty">No usage history yet</div>

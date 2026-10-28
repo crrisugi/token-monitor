@@ -267,11 +267,13 @@ const {
 const { sessionUsageArchiveDate } = require('../shared/usage/sessionUsageArchive');
 const {
   createSessionUsageArchiveStore,
+  readSessionUsageArchiveSnapshot,
   sessionUsageArchiveDatabasePath
 } = require('../shared/usage/sessionUsageArchiveStore');
 const { createUsageTransform, usageTransformSettings } = require('../shared/usage/usageTransform');
 const { createUsageHost, terminateUsageHostSubprocesses, whenUsageHostsIdle } = require('../shared/usage/usageHost');
-const { clearDailyHistoryArchive } = require('../shared/dailyHistoryArchive');
+const { clearDailyHistoryArchive, readDailyHistoryArchive } = require('../shared/dailyHistoryArchive');
+const accountUsageLedger = require('../shared/providers/antigravity/accountUsageLedger');
 const { aggregateDevices, aggregateHistory } = require('../shared/usage');
 const {
   HUB_RESPONSE_HEADER,
@@ -8740,7 +8742,99 @@ app.whenReady().then(() => {
       .catch((error) => ({ ok: false, error: error.message }));
   });
   ipcMain.handle('app:openUserData', () => shell.openPath(app.getPath('userData')));
+  function notifyDashboardHistoryUpdated() {
+    if (dashboardWindow && !dashboardWindow.isDestroyed()) {
+      try { dashboardWindow.webContents.send('dashboard:historyChanged'); } catch (_) {}
+    }
+  }
+
+  function getAntigravityAccountUsagePayload(options = {}) {
+    const discoveredAccounts = accountUsageLedger.discoverAccounts({ settings });
+    const activeAccount = accountUsageLedger.detectActiveAccount({ settings });
+    if (activeAccount) {
+      try {
+        accountUsageLedger.recordAccountHeartbeat(activeAccount);
+      } catch (_) {}
+    }
+
+    let sessions = [];
+    try {
+      const archive = sessionUsageArchiveStore?.snapshot?.() || readSessionUsageArchiveSnapshot();
+      if (archive?.sessions) {
+        sessions = Object.values(archive.sessions)
+          .filter((s) => accountUsageLedger.isAntigravityClient(s?.client))
+          .map((s) => {
+            const p = s.periods?.allTime || s.periods?.month || s.periods?.today || {};
+            return {
+              ...s,
+              ...p,
+              client: s.client || p.client,
+              sessionId: s.sessionId || p.sessionId,
+              day: s.day || p.day || (p.startedAt ? p.startedAt.slice(0, 10) : ''),
+              startedAt: p.startedAt || s.capturedAt,
+              lastUsedAt: p.lastUsedAt || s.capturedAt,
+              totalTokens: Number(p.totalTokens ?? s.totalTokens ?? 0),
+              costUsd: Number(p.costUsd ?? s.costUsd ?? 0),
+              inputTokens: Number(p.inputTokens ?? s.inputTokens ?? 0),
+              outputTokens: Number(p.outputTokens ?? s.outputTokens ?? 0),
+              cacheReadTokens: Number(p.cacheReadTokens ?? s.cacheReadTokens ?? 0),
+              cacheWriteTokens: Number(p.cacheWriteTokens ?? s.cacheWriteTokens ?? 0),
+              reasoningTokens: Number(p.reasoningTokens ?? s.reasoningTokens ?? 0),
+              models: (s.models && Object.keys(s.models).length > 0) ? s.models : (p.models || {}),
+              modelCosts: (s.modelCosts && Object.keys(s.modelCosts).length > 0) ? s.modelCosts : (p.modelCosts || {})
+            };
+          });
+      }
+    } catch (_) {}
+
+    let dailyHistory = [];
+    try {
+      const archive = readDailyHistoryArchive();
+      if (archive?.days) {
+        for (const dayObj of Object.values(archive.days)) {
+          if (dayObj?.observations) {
+            for (const obs of Object.values(dayObj.observations)) {
+              if (accountUsageLedger.isAntigravityClient(obs?.client)) {
+                dailyHistory.push(obs);
+              }
+            }
+          }
+        }
+      }
+    } catch (_) {}
+
+    const ledger = accountUsageLedger.loadLedger();
+    const summary = accountUsageLedger.aggregateAccountUsage({
+      sessions,
+      dailyHistory,
+      range: options.range || null,
+      accountFilter: options.accountFilter || 'all',
+      ledger,
+      discoveredAccounts
+    });
+
+    return {
+      summary,
+      discoveredAccounts,
+      activeAccount,
+      ledger: accountUsageLedger.loadLedger()
+    };
+  }
+
   ipcMain.handle('antigravity:accounts', () => antigravityAccountsForRenderer());
+  ipcMain.handle('antigravity:getLedger', () => accountUsageLedger.loadLedger());
+  ipcMain.handle('antigravity:getDiscoveredAccounts', () => accountUsageLedger.discoverAccounts({ settings }));
+  ipcMain.handle('antigravity:assignDateRange', (_event, rule) => {
+    accountUsageLedger.assignDateRange(rule);
+    notifyDashboardHistoryUpdated();
+    return getAntigravityAccountUsagePayload({ range: rule ? { start: rule.startDate, end: rule.endDate } : null });
+  });
+  ipcMain.handle('antigravity:removeDateRange', (_event, rule) => {
+    accountUsageLedger.removeDateRange(rule);
+    notifyDashboardHistoryUpdated();
+    return getAntigravityAccountUsagePayload();
+  });
+  ipcMain.handle('antigravity:getAccountUsageSummary', (_event, options) => getAntigravityAccountUsagePayload(options || {}));
   ipcMain.handle('workbuddy:accounts', () => workbuddyAccountsForRenderer());
   ipcMain.handle('workbuddy:addAccount', (_event, realm) => workbuddyAccountOperation((service) => service.addAccount(realm)));
   ipcMain.handle('workbuddy:cancelLogin', () => workbuddyManagedAccountService?.cancelLogin() || false);

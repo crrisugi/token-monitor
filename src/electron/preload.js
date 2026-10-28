@@ -130,7 +130,12 @@ contextBridge.exposeInMainWorld('tokenMonitor', {
       const handler = (_event, accounts) => callback(accounts);
       ipcRenderer.on('antigravity:accounts', handler);
       return () => ipcRenderer.removeListener('antigravity:accounts', handler);
-    }
+    },
+    getLedger: () => ipcRenderer.invoke('antigravity:getLedger'),
+    getDiscoveredAccounts: () => ipcRenderer.invoke('antigravity:getDiscoveredAccounts'),
+    assignDateRange: (rule) => ipcRenderer.invoke('antigravity:assignDateRange', rule),
+    removeDateRange: (rule) => ipcRenderer.invoke('antigravity:removeDateRange', rule),
+    getAccountUsageSummary: (options) => ipcRenderer.invoke('antigravity:getAccountUsageSummary', options)
   },
   workbuddy: {
     accounts: () => ipcRenderer.invoke('workbuddy:accounts'),
