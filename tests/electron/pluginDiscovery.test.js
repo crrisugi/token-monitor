@@ -81,6 +81,14 @@ test('README Markdown preserves layout, resolves relative images and cannot inje
   assert.match(result.html, /data-readme-image="0"/); assert.doesNotMatch(result.html, /<img|<script|href="javascript:|src="file:/);
   assert.match(result.html, /&lt;script&gt;/); assert.match(result.html, /href="https:\/\/github.com\/author\/project\/blob\/main\/docs\/guide.md"/);
 });
+test('README root-relative links resolve against the repository root, not the host root', () => {
+  const result = renderReadme('[Root](/docs/guide.md)\n\n[External](https://example.test/guide.md)\n\n[Network](//cdn.example.test/guide.md)', 'https://github.com/owner/project/blob/main/docs/README.md', 'https://raw.githubusercontent.com/owner/project/main/docs/README.md', 'https://github.com/owner/project/blob/main/');
+  assert.match(result.html, /href="https:\/\/github\.com\/owner\/project\/blob\/main\/docs\/guide\.md"/);
+  assert.match(result.html, /href="https:\/\/example\.test\/guide\.md"/);
+  assert.match(result.html, /href="https:\/\/cdn\.example\.test\/guide\.md"/);
+  assert.doesNotMatch(result.html, /href="https:\/\/github\.com\/docs\/guide\.md"/);
+});
+
 test('README image access is scoped to the active detail document, after another detail is opened', async t => {
   const catalog = createPluginCatalog({ githubDiscoveryEnabled: true, root: temp(t), manager: { list: () => ({ plugins: [] }) }, managed: { describe() {}, cancelSource() {} }, fetchImpl: async url => response(url.endsWith('/readme') ? { download_url: 'https://raw.githubusercontent.com/author/project/main/README.md', html_url: 'https://github.com/author/project/blob/main/README.md', encoding: 'base64', content: Buffer.from('![Shot](image.png)').toString('base64') } : raw()) });
   t.after(() => catalog.dispose()); await catalog.discover();
@@ -134,8 +142,9 @@ test('catalog README repository ownership allows GitHub canonical casing without
 test('README page URLs must be browsable files owned by the selected repository', async t => {
   let htmlUrl;
   const discovery = createGitHubDiscovery({ root: temp(t), fetchImpl: async () => response({
+    path: 'docs/README.md',
     download_url: 'https://raw.githubusercontent.com/author/project/main/docs/README.md', html_url: htmlUrl,
-    encoding: 'base64', content: Buffer.from('[Guide](./guide.md)\n\n![Shot](../images/demo.png)').toString('base64')
+    encoding: 'base64', content: Buffer.from('[Guide](./guide.md)\n\n[Root](/docs/root.md)\n\n![Shot](../images/demo.png)').toString('base64')
   }) }); t.after(() => discovery.dispose());
   for (const invalid of [undefined, 'https://evil.test/author/project/blob/main/docs/README.md',
     'https://github.com/other/project/blob/main/README.md', 'https://github.com/author/project/issues/1',
@@ -146,7 +155,78 @@ test('README page URLs must be browsable files owned by the selected repository'
   }
   htmlUrl = 'https://github.com/AUTHOR/PROJECT/blob/main/docs/README.md';
   const result = await discovery.repositoryReadme('https://github.com/author/project');
-  const rendered = renderReadme(result.readme, result.baseUrl, result.imageBaseUrl);
+  assert.equal(result.repositoryBaseUrl, 'https://github.com/AUTHOR/PROJECT/blob/main/');
+  const rendered = renderReadme(result.readme, result.baseUrl, result.imageBaseUrl, result.repositoryBaseUrl);
   assert.match(rendered.html, /href="https:\/\/github.com\/AUTHOR\/PROJECT\/blob\/main\/docs\/guide.md"/);
+  assert.match(rendered.html, /href="https:\/\/github.com\/AUTHOR\/PROJECT\/blob\/main\/docs\/root.md"/);
   assert.deepEqual(rendered.images, ['https://raw.githubusercontent.com/author/project/main/images/demo.png']);
+});
+
+test('catalog README path maps are bounded repository-relative Markdown files', () => {
+  const entry = { id: 'path-plugin', name: 'Path', repository: 'https://github.com/owner/project',
+    readmePaths: { en: 'plugins/path/README.md', 'zh-TW': 'plugins/path/README.zh-TW.md' },
+    versions: [{ version: '1.0.0', url: 'https://example.test/package', sha256: 'a'.repeat(64) }] };
+  const parse = patch => parseIndex(Buffer.from(JSON.stringify({ format: 1, title: 'Paths', plugins: [{ ...entry, ...patch }] })));
+  assert.deepEqual(parse({}).plugins[0].readmePaths, entry.readmePaths);
+  for (const file of ['../README.md', '/README.md', 'a/../../README.md', 'a//README.md', 'a/%2e%2e/README.md', 'a/README.md?q=1', 'https://other.test/a.md', 'a/README.html']) {
+    assert.throws(() => parse({ readmePaths: { en: file } }), /README/);
+  }
+  for (const readmePaths of [{}, [], 'README.md', { invalid_locale: 'README.md' }]) assert.throws(() => parse({ readmePaths }), /README/);
+  assert.throws(() => parse({ repository: undefined }), /repository/);
+});
+
+test('catalog details select the plugin README language and keep its nested link/image base', async t => {
+  const url = 'https://catalog.example/paths.json', calls = []; let locale = 'zh-TW';
+  const paths = { en: 'plugins/one/README.md', 'zh-TW': 'plugins/one/README.zh-TW.md', 'pt-BR': 'plugins/one/README.pt-BR.md' };
+  const entry = { id: 'one-plugin', name: 'One', repository: 'https://github.com/author/project', readmePaths: paths,
+    versions: [{ version: '1.0.0', url: 'https://example.test/package', sha256: 'a'.repeat(64), changelog: { en: 'English update', 'zh-TW': '更新內容' } }] };
+  const catalog = createPluginCatalog({ root: temp(t), getLocale: () => locale,
+    manager: { list: () => ({ plugins: [] }) }, managed: { describe() {}, cancelSource() {} },
+    maintainerSources: [{ id: 'maintainer-paths', url }], fetchImpl: async target => {
+      calls.push(target);
+      if (target === url) return response({ format: 1, title: 'Paths', plugins: [entry] });
+      const file = target.split('/contents/')[1];
+      return response({ type: 'file', path: file, encoding: 'base64', content: Buffer.from(`# ${file}\n\n[History](CHANGELOG.md)\n\n![Screenshot](docs/images/page.png)`).toString('base64'),
+        download_url: `https://raw.githubusercontent.com/author/project/main/${file}`, html_url: `https://github.com/author/project/blob/main/${file}` });
+    } });
+  t.after(() => catalog.dispose());
+  const list = await catalog.discover(); assert.equal(list.entries[0].versions[0].changelog, '更新內容');
+  assert.equal(calls.length, 1);
+  let details = await catalog.details('maintainer-paths', 'one-plugin');
+  assert.equal(calls.at(-1), 'https://api.github.com/repos/author/project/contents/plugins/one/README.zh-TW.md');
+  assert.match(details.html, /href="https:\/\/github.com\/author\/project\/blob\/main\/plugins\/one\/CHANGELOG.md"/);
+  assert.equal(details.imageCount, 1);
+  locale = 'pt-BR'; await catalog.details('maintainer-paths', 'one-plugin'); assert.match(calls.at(-1), /README.pt-BR.md$/);
+  locale = 'fr'; await catalog.details('maintainer-paths', 'one-plugin'); assert.match(calls.at(-1), /README.md$/);
+  assert.ok(!calls.some(target => target.includes('/search/')));
+});
+
+test('custom catalogs use the default README unless they explicitly declare localized plugin paths', async t => {
+  const url = 'https://catalog.example/custom.json', calls = [];
+  const catalog = createPluginCatalog({ root: temp(t), getLocale: () => 'zh-TW',
+    manager: { list: () => ({ plugins: [] }) }, managed: { describe() {}, cancelSource() {} },
+    fetchImpl: async target => {
+      calls.push(target);
+      if (target === url) return response({ format: 1, title: 'Custom', plugins: [
+        { id: 'root-readme', name: 'Root', repository: 'https://github.com/author/project', versions: [{ version: '1.0.0', url: 'https://example.test/package', sha256: 'a'.repeat(64) }] },
+        { id: 'nested-readme', name: 'Nested', repository: 'https://github.com/author/project', readmePaths: { 'zh-TW': 'plugins/nested/README.zh-TW.md' }, versions: [{ version: '1.0.0', url: 'https://example.test/package', sha256: 'b'.repeat(64) }] }
+      ] });
+      const file = target.endsWith('/readme') ? 'README.md' : 'plugins/nested/README.zh-TW.md';
+      return response({ type: 'file', path: file, encoding: 'base64', content: Buffer.from(`# ${file}`).toString('base64'),
+        download_url: `https://raw.githubusercontent.com/author/project/main/${file}`, html_url: `https://github.com/author/project/blob/main/${file}` });
+    } });
+  t.after(() => catalog.dispose());
+  const state = await catalog.addSource({ url }), id = state.sources.find(s => s.kind === 'community').id;
+  await catalog.details(id, 'root-readme'); assert.equal(calls.at(-1), 'https://api.github.com/repos/author/project/readme');
+  await catalog.details(id, 'nested-readme'); assert.equal(calls.at(-1), 'https://api.github.com/repos/author/project/contents/plugins/nested/README.zh-TW.md');
+});
+
+test('explicit README content must be the requested file, with no redirect-like raw URL metadata', async t => {
+  const file = 'plugins/one/README.md'; let patch = {};
+  const github = createGitHubDiscovery({ root: temp(t), fetchImpl: async () => response({ type: 'file', path: file, encoding: 'base64', content: Buffer.from('Hello').toString('base64'),
+    download_url: `https://raw.githubusercontent.com/author/project/main/${file}`, html_url: `https://github.com/author/project/blob/main/${file}`, ...patch }) });
+  t.after(() => github.dispose());
+  for (patch of [{ path: 'README.md' }, { type: 'dir' }, { download_url: `https://raw.githubusercontent.com:8443/author/project/main/${file}` }, { download_url: `https://raw.githubusercontent.com/author/project/main/${file}?q=1` }]) {
+    await assert.rejects(github.repositoryReadme('https://github.com/author/project', undefined, file), /Invalid README/);
+  }
 });

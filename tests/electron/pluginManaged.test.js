@@ -14,7 +14,7 @@ function bytes(version = '1.0.0', extra = {}) {
 }
 function fixture(t, fault) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tm-managed-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  let settings = { pluginPlacementDefaults: {}, pluginMainPages: [], trayContent: 'tokens', trayCustomLayout: { version: 1, items: [] }, floatingBubbleCustomLayout: { version: 1, items: [{ id: 'own', type: 'plugin', ref: 'test-plugin/page' }, { id: 'other', type: 'plugin', ref: 'other/page' }] }, notchCustomLayout: { version: 1, items: [{ id: 'own', type: 'plugin', ref: 'test-plugin/page' }, { id: 'other', type: 'plugin', ref: 'other/page' }] }, notchPageOrder: ['plugin:test-plugin/page', 'home', 'plugin:other/page'], pluginContentOrder: { 'main.model.content': ['test-plugin/page', 'other/page'] }, pluginContentSelections: { 'main.limits.content': 'test-plugin/page', 'main.home.content': 'other/page' }, pluginStates: {}, homeModuleOrder: 'summary,plugin:test-plugin/page,plugin:other/page', hiddenHomeModules: '', edgeDockItems: [], notchPluginPages: ['test-plugin/page', 'other/page'] };
+  let settings = { pluginInitialSetup: {}, pluginMainPages: [], trayContent: 'tokens', trayCustomLayout: { version: 1, items: [] }, floatingBubbleCustomLayout: { version: 1, items: [{ id: 'own', type: 'plugin', ref: 'test-plugin/page' }, { id: 'other', type: 'plugin', ref: 'other/page' }] }, notchCustomLayout: { version: 1, items: [{ id: 'own', type: 'plugin', ref: 'test-plugin/page' }, { id: 'other', type: 'plugin', ref: 'other/page' }] }, notchPageOrder: ['plugin:test-plugin/page', 'home', 'plugin:other/page'], pluginContentOrder: { 'main.model.content': ['test-plugin/page', 'other/page'] }, pluginContentSelections: { 'main.limits.content': 'test-plugin/page', 'main.home.content': 'other/page' }, pluginStates: {}, homeModuleOrder: 'summary,plugin:test-plugin/page,plugin:other/page', hiddenHomeModules: '', edgeDockItems: [], notchPluginPages: ['test-plugin/page', 'other/page'] };
   let stopped = 0;
   const manager = { list: () => ({ plugins: [] }), beginMutation: () => stopped++, endMutation() {}, reload() {} };
   const args = { root: path.join(dir, 'manager'), userDir: path.join(dir, 'plugins'), dataDir: path.join(dir, 'data'), settingsDir: path.join(dir, 'author-settings'), manager,
@@ -27,6 +27,7 @@ async function historyFixture(t, fault) {
   const f = fixture(t, fault); await f.install('1.0.0'); await f.install('2.0.0');
   f.settings.pluginStates['test-plugin'] = { enabled: true, background: false, trustedRevision: 'a'.repeat(64) };
   // Include every placement key in the rollback baseline.
+  f.settings.pluginContentSelections['main.limits.content'] = 'test-plugin/page';
   f.settings.trayCustomLayout = { version: 1, items: [] };
   f.settings.pluginMainPages = ['test-plugin/page', 'other/page'];
   for (const dir of [f.args.dataDir, f.args.settingsDir]) {
@@ -47,6 +48,55 @@ function snapshot(f) {
   visit(f.dir);
   return { files, settings: structuredClone(f.settings) };
 }
+
+for (const invalidate of ['cancel', 'expire']) test(`a preview ${invalidate}d while consent is open cannot be committed`, async t => {
+  const f = fixture(t);
+  let clock = 1;
+  f.args.manager.list = () => ({ enabled: true, plugins: [] });
+  const api = createManagedPlugins({ ...f.args, now: () => clock }); api.recover();
+  t.after(() => api.dispose());
+  const preview = api.preview(parsePackage(bytes()));
+  const before = snapshot(f);
+  await assert.rejects(api.install(preview.token, { trustInstall: true, beforeEnable() {
+    if (invalidate === 'cancel') api.cancel(preview.token); else clock += 10 * 60 * 1000 + 1;
+  } }), /preview expired/);
+  assert.deepEqual(snapshot(f), before);
+});
+
+test('an update preserves a newer content choice made while its backend is stopping', { timeout: 5000 }, async t => {
+  const f = fixture(t); await f.install('1.0.0');
+  f.args.manager.list = () => ({ enabled: true, plugins: [] });
+  f.settings.pluginStates['test-plugin'] = { enabled: true };
+  f.settings.pluginContentSelections['main.model.content'] = 'other/view';
+  let started, finish;
+  const entered = new Promise(resolve => { started = resolve; });
+  const gate = new Promise(resolve => { finish = resolve; });
+  f.args.manager.beginMutation = () => { started(); return gate; };
+  const pkg = parsePackage(bytes('2.0.0', { views: [{ id: 'content', mode: 'replace', targets: ['main.model.content'] }] }));
+  const pending = f.api.install(f.api.preview(pkg).token, { trustUpdate: true, initialSetup: { 'content:main.model.content': 'test-plugin/content' } }).then(() => null, error => error);
+  await entered;
+  delete f.settings.pluginContentSelections['main.model.content'];
+  finish();
+  assert.match((await pending)?.message || '', /Content selection changed/);
+  assert.equal(f.settings.pluginContentSelections['main.model.content'], undefined);
+  assert.equal(f.api.describe('test-plugin').version, '1.0.0');
+  assert.equal(fs.existsSync(path.join(f.args.root, 'transaction.json')), false);
+});
+
+for (const keepPlacements of [false, true]) for (const hasSetup of [false, true]) {
+  test(`constructor plugin uninstalls with keepPlacements=${keepPlacements}, own setup=${hasSetup}`, async t => {
+    const f = fixture(t);
+    await f.install('1.0.0', { id: 'constructor', views: [] });
+    if (hasSetup) f.settings.pluginInitialSetup.constructor = { values: { background: true, skin: null, 'content:main.home.content': null }, applied: ['background', 'skin', 'content:main.home.content'] };
+    await f.api.uninstall('constructor', { keepPlacements });
+    assert.equal(f.api.describe('constructor'), null);
+    assert.equal(fs.existsSync(path.join(f.args.userDir, 'constructor')), false);
+    assert.equal(Object.hasOwn(f.settings.pluginInitialSetup, 'constructor'), keepPlacements && hasSetup);
+    if (keepPlacements && hasSetup) assert.deepEqual(f.settings.pluginInitialSetup.constructor, {
+      values: { 'content:main.home.content': null }, applied: ['content:main.home.content']
+    });
+  });
+}
 async function operation(api, name, token) {
   if (name === 'preview') return api.preview(parsePackage(bytes('3.0.0', {})));
   if (name === 'update') return await api.install(token);
@@ -58,6 +108,34 @@ function assetPackage(version) {
   const raw = JSON.parse(bytes(version, { files: ['main.js', 'ui/page.js', 'ui/index.html'] }));
   Object.assign(raw.files, { 'ui/page.js': Buffer.from('console.log(1)').toString('base64'), 'ui/index.html': Buffer.from('<p>Original</p>').toString('base64') });
   return parsePackage(JSON.stringify(raw, null, 2));
+}
+
+for (const phase of ['settings-written', 'reloaded']) {
+  test(`first-use transaction restores locations, content, background and appearance after ${phase} failure`, async t => {
+    let changed;
+    const f = fixture(t, step => {
+      if (step === phase) { changed = structuredClone(f.settings); throw new Error('setup interrupted'); }
+    });
+    Object.assign(f.settings, { themeColors: { accent: '#123456' }, vendorColors: { codex: '#654321' }, pluginAuthorSkin: null });
+    f.args.manager.list = () => ({ enabled: true, plugins: [] });
+    const pkg = parsePackage(bytes('1.0.0', { background: true,
+      views: [{ id: 'page', title: 'Page', surfaces: ['page'], defaultSurfaces: ['page'] },
+        { id: 'content', title: 'Content', targets: ['main.model.content'], mode: 'replace' }],
+      skins: [{ id: 'blue', name: 'Blue', colors: { accent: '#abcdef' }, vendorColors: { codex: '#fedcba' }, appearance: { font: 'mono' } }],
+      defaults: { background: true, skin: 'blue' } }));
+    const before = structuredClone(f.settings);
+    await assert.rejects(f.api.install(f.api.preview(pkg).token, { trustInstall: true }), /setup interrupted/);
+    assert.deepEqual(changed.pluginMainPages, ['test-plugin/page']);
+    assert.equal(changed.pluginContentSelections['main.model.content'], 'test-plugin/content');
+    assert.equal(changed.pluginStates['test-plugin'].background, true);
+    assert.equal(changed.themeColors.accent, '#abcdef');
+    assert.equal(changed.vendorColors.codex, '#fedcba');
+    assert.equal(changed.pluginAuthorSkin.ref, 'test-plugin/blue');
+    assert.ok(changed.pluginInitialSetup['test-plugin'].applied.includes('skin'));
+    assert.deepEqual(f.settings, before);
+    assert.equal(fs.existsSync(path.join(f.args.userDir, 'test-plugin')), false);
+    assert.deepEqual(f.api.list(), []);
+  });
 }
 function changeInstalled(f, kind) {
   const dir = path.join(f.args.userDir, 'test-plugin');
@@ -485,9 +563,10 @@ for (const keepPlacements of [false, true]) test(`compact placement transaction 
       throw new Error('compact placement interruption');
     }
   });
+  f.settings.pluginInitialSetup = { 'test-plugin': { values: { 'content:main.home.content': null }, applied: ['content:main.home.content'] }, other: { values: { 'content:main.model.content': null }, applied: ['content:main.model.content'] } };
   const before = snapshot(f); armed = true;
   await assert.rejects(f.api.uninstall('test-plugin', { keepData: true, keepPlacements }), /compact placement interruption/);
-  for (const key of ['floatingBubbleCustomLayout', 'notchCustomLayout', 'notchPageOrder']) assert.deepEqual(journal.settings[key], before.settings[key]);
+  for (const key of ['floatingBubbleCustomLayout', 'notchCustomLayout', 'notchPageOrder', 'pluginInitialSetup']) assert.deepEqual(journal.settings[key], before.settings[key]);
   assert.deepEqual(snapshot(f), before);
   const restarted = createManagedPlugins(f.args); restarted.recover();
   assert.deepEqual(snapshot(f), before);
@@ -500,6 +579,34 @@ for (const enabled of [true, false]) test(`trusted update preserves enabled=${en
   await f.api.install(f.api.preview(pkg).token, { trustUpdate: true });
   assert.deepEqual(f.settings.pluginStates['test-plugin'], { enabled, background: true, trustedRevision: require('../../src/electron/plugins/package').contentDigest(pkg) });
 });
+
+for (const missing of ['map', 'record', 'enabled']) test(`an update with missing plugin state (${missing}) saves first-use choices without applying them`, async t => {
+  const f = fixture(t);
+  f.args.manager.list = () => ({ enabled: true, plugins: [] });
+  await f.install('1.0.0', { views: [] });
+  if (missing === 'map') delete f.settings.pluginStates;
+  else if (missing === 'record') delete f.settings.pluginStates['test-plugin'];
+  else f.settings.pluginStates['test-plugin'] = { background: false };
+  Object.assign(f.settings, { pluginInitialSetup: {}, pluginContentSelections: { 'main.home.content': 'other/page' },
+    themeColors: { accent: '#123456' }, vendorColors: {}, pluginAuthorSkin: null });
+  const before = structuredClone(f.settings);
+  const pkg = parsePackage(bytes('2.0.0', { background: true,
+    views: [{ id: 'dashboard', surfaces: ['page'], defaultSurfaces: ['page'] },
+      { id: 'content', mode: 'replace', targets: ['main.model.content'] }],
+    skins: [{ id: 'blue', name: 'Blue', colors: { accent: '#abcdef' } }],
+    defaults: { background: true, skin: 'blue' } }));
+  let confirmations = 0;
+  await f.api.install(f.api.preview(pkg).token, { trustUpdate: true, beforeEnable() { confirmations++; } });
+  assert.equal(f.api.describe('test-plugin').version, '2.0.0');
+  assert.equal(confirmations, 0);
+  assert.notEqual(f.settings.pluginStates['test-plugin'].enabled, true);
+  assert.equal(f.settings.pluginStates['test-plugin'].background, before.pluginStates?.['test-plugin']?.background);
+  for (const key of ['pluginMainPages', 'pluginContentSelections', 'themeColors', 'vendorColors', 'pluginAuthorSkin']) assert.deepEqual(f.settings[key], before[key], key);
+  assert.deepEqual(f.settings.pluginInitialSetup['test-plugin'], { values: {
+    'placement:test-plugin/dashboard:page': true, 'content:main.model.content': 'test-plugin/content', background: true, skin: 'test-plugin/blue'
+  }, applied: [] });
+});
+
 for (const point of ['settings-written', 'reloaded']) test(`failed trusted update restores previous trust at ${point}`, async t => {
   let armed = false;
   const f = fixture(t, step => { if (armed && step === point) throw Error('interrupted'); });
@@ -540,4 +647,54 @@ for (const point of ['settings-written', 'reloaded']) test(`default locations ro
   await assert.rejects(f.api.install(f.api.preview(pkg).token, { trustInstall:true }), /interrupted defaults/);
   assert.deepEqual(f.settings, before);
   assert.equal(f.api.list().length, 0);
+});
+for(const point of ['credentials-moved','registry-written','settings-written','reloaded'])test(`uninstall rolls back only its private credentials after ${point}`,async t=>{
+ let armed=false;const f=fixture(t,phase=>{if(armed&&phase===point)throw Error('synthetic transaction failure');});
+ await f.install('1.0.0');f.args.credentialsDir=path.join(f.dir,'private-credentials');
+ const api=createManagedPlugins(f.args);api.recover();fs.mkdirSync(f.args.credentialsDir,{mode:0o700});
+ const own=path.join('test-plugin','one.json'),other=path.join('test-plugin--other','one.json');
+ for(const name of [own,other]){fs.mkdirSync(path.dirname(path.join(f.args.credentialsDir,name)),{recursive:true,mode:0o700});fs.writeFileSync(path.join(f.args.credentialsDir,name),'synthetic-private-record',{mode:0o600});}
+ armed=true;await assert.rejects(api.uninstall('test-plugin',{keepData:true}),/synthetic transaction failure/);
+ assert.equal(fs.readFileSync(path.join(f.args.credentialsDir,own),'utf8'),'synthetic-private-record');assert.ok(fs.existsSync(path.join(f.args.userDir,'test-plugin')));
+ armed=false;await api.uninstall('test-plugin',{keepData:true});assert.equal(fs.existsSync(path.join(f.args.credentialsDir,own)),false);assert.equal(fs.existsSync(path.join(f.args.credentialsDir,other)),true);
+});
+
+for(const dangling of [false,true])test(`uninstall rejects a plugin credential directory symlink without touching its target, dangling=${dangling}`,async t=>{
+ const f=fixture(t);await f.install('1.0.0');f.args.credentialsDir=path.join(f.dir,'private-credentials');
+ const api=createManagedPlugins(f.args);api.recover();fs.mkdirSync(f.args.credentialsDir,{mode:0o700});
+ const outside=path.join(f.dir,'outside-credentials'),link=path.join(f.args.credentialsDir,'test-plugin');
+ if(!dangling){fs.mkdirSync(outside,{mode:0o700});fs.writeFileSync(path.join(outside,'one.json'),'synthetic outside',{mode:0o600});}
+ fs.symlinkSync(outside,link,process.platform==='win32'?'junction':'dir');
+ await assert.rejects(api.uninstall('test-plugin',{keepData:true}),/invalid credential directory/);
+ assert.equal(fs.lstatSync(link).isSymbolicLink(),true);assert.ok(fs.existsSync(path.join(f.args.userDir,'test-plugin')));
+ if(!dangling)assert.equal(fs.readFileSync(path.join(outside,'one.json'),'utf8'),'synthetic outside');
+});
+
+for(const scenario of ['valid','backup-link','backup-dangling','destination-link','destination-dangling','destination-empty','destination-records'])test(`credential namespace recovery validates both endpoints before moving anything: ${scenario}`,async t=>{
+ const f=fixture(t);await f.install('1.0.0');
+ f.args.credentialsDir=path.join(f.dir,'private-credentials');fs.mkdirSync(f.args.credentialsDir,{mode:0o700});
+ const tx=path.join(f.args.root,'transaction'),backup=path.join(tx,'plugin-credentials'),target=path.join(f.args.credentialsDir,'test-plugin'),outside=path.join(f.dir,'outside');
+ fs.mkdirSync(tx,{mode:0o700});fs.mkdirSync(outside,{mode:0o700});fs.writeFileSync(path.join(outside,'one.json'),'synthetic outside');
+ if(scenario.startsWith('backup-'))fs.symlinkSync(scenario==='backup-dangling'?path.join(f.dir,'missing'):outside,backup,process.platform==='win32'?'junction':'dir');
+ else{fs.mkdirSync(backup,{mode:0o700});fs.writeFileSync(path.join(backup,'one.json'),'synthetic staged');}
+ if(scenario.startsWith('destination-')){
+  if(scenario==='destination-link'||scenario==='destination-dangling')fs.symlinkSync(scenario==='destination-dangling'?path.join(f.dir,'missing'):outside,target,process.platform==='win32'?'junction':'dir');
+  else{fs.mkdirSync(target);if(scenario==='destination-records')fs.writeFileSync(path.join(target,'one.json'),'synthetic current');}
+ }
+ const packageTarget=path.join(f.args.userDir,'test-plugin'),packageBackup=path.join(tx,'old');
+ fs.renameSync(packageTarget,packageBackup);
+ const journal=path.join(f.args.root,'transaction.json'),registry=JSON.parse(fs.readFileSync(path.join(f.args.root,'installed.json')));
+ fs.writeFileSync(journal,JSON.stringify({id:'test-plugin',operation:'uninstall',phase:'prepared',hadTarget:true,hadPrevious:false,settings:f.settings,registry}));
+ const recovery=createManagedPlugins(f.args);
+ if(scenario==='valid'){
+  recovery.recover();assert.equal(fs.readFileSync(path.join(target,'one.json'),'utf8'),'synthetic staged');assert.equal(fs.existsSync(journal),false);
+ }else{
+  assert.throws(()=>recovery.recover(),/credential/);
+  assert.equal(fs.existsSync(packageTarget),false,'preflight runs before package restoration');
+  assert.equal(fs.existsSync(packageBackup),true);
+  assert.equal(fs.existsSync(journal),true,'failed recovery keeps journal');assert.ok(fs.lstatSync(backup),'staged namespace stays recoverable');
+  if(scenario.startsWith('destination-'))assert.ok(fs.lstatSync(target),'existing namespace is not replaced');
+  assert.equal(fs.readFileSync(path.join(outside,'one.json'),'utf8'),'synthetic outside');
+  if(scenario==='destination-records')assert.equal(fs.readFileSync(path.join(target,'one.json'),'utf8'),'synthetic current');
+ }
 });

@@ -9,6 +9,7 @@ const PERIODS = ['today', 'month', 'allTime'];
 const { normalizeLiveActivity, normalizeReasoningEffort, isSessionReasoningEffortClient, canReplaceLiveActivity, sessionWithActivity } = require('./sessionLive');
 const { aggregateLimits, normalizeLimitsSummary } = require('./limits/core');
 const { normalizeClientHealth } = require('./clientHealth');
+const { normalizeDeviceKind } = require('./deviceKind');
 const {
   coerceHistory, dayKeyAddDays, hasDisjointReasoning, localDayKey, mergeHistories,
   normalizeTokscaleClientName, normalizeTokscaleModelNameForClient
@@ -55,13 +56,13 @@ const SESSION_TEXT_KEYS = [
 ];
 const GUI_SECRET_LIMIT_PROVIDERS = new Set(['copilot', 'deepseek', 'factory', 'minimax']);
 
-function asNumber(value) {
+function asNumber(value, fallback = 0) {
   if (typeof value === 'number' && Number.isFinite(value)) return value;
   if (typeof value === 'string' && value.trim() !== '') {
     const parsed = Number(value.replace(/[$,]/g, ''));
     if (Number.isFinite(parsed)) return parsed;
   }
-  return 0;
+  return fallback;
 }
 
 function firstNumber(obj, keys) {
@@ -320,6 +321,7 @@ function normalizeClientName(value) {
   if (raw.includes('workbuddy')) return 'workbuddy';
   if (raw.includes('proma')) return 'proma';
   if (raw === 'catpaw') return 'catpaw';
+  if (raw === 'qoder') return 'qoder';
   if (raw.includes('qodercn') || raw === 'qoder-cn' || raw === 'qoder cn') return 'qodercn';
   if (raw.includes('reasonix')) return 'reasonix';
   if (/cherry[\s_-]*studio/.test(raw)) return 'cherrystudio';
@@ -327,7 +329,10 @@ function normalizeClientName(value) {
   if (/^unsloth(?:[\s_-]+(?:studio|api))?$/.test(raw)) return 'unsloth';
   if (raw.includes('dsh')) return 'dsh';
   if (raw.includes('devin')) return 'devin';
+  if (/^prime[\s_-]*agent$/.test(raw)) return 'prime-agent';
+  if (/^j[\s_-]*code$/.test(raw)) return 'jcode';
   if (raw === 'fx') return 'fx';
+  if (raw === 'mistral' || /^mistral[\s_-]*vibe$/.test(raw)) return 'mistral';
   // Tokscale's id for MiniMax Code. The bare vendor name stays a model vendor
   // and limits provider, so only the product spellings map here.
   if (raw === 'mcode' || /^minimax[\s_-]*code$/.test(raw)) return 'mcode';
@@ -358,6 +363,11 @@ function normalizeModelNameForClient(value, client) {
   if (!normalized || normalizeClientName(client) !== REASONIX_CLIENT) return normalized;
   const qualified = normalized.match(/^(?:deepseek|deepseek-flash)\/(.+)$/);
   return qualified?.[1] || normalized;
+}
+
+function normalizeLatestModel(value, client) {
+  if (typeof value !== 'string' || value.length > 256) return null;
+  return normalizeModelNameForClient(value, client);
 }
 
 function normalizeSessionId(value) {
@@ -623,6 +633,43 @@ function collectUsageRows(node, rows) {
   }
 }
 
+const SESSION_MODEL_COMPONENT_FIELDS = ['inputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'outputTokens'];
+
+// Each entry describes an observed portion of a model bucket, not an inferred
+// decomposition of the whole session. Legacy/unobserved portions stay unknown.
+function normalizeSessionModelComponents(input, session, normalizeModel) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return undefined;
+  const result = Object.create(null);
+  for (const [rawModel, row] of Object.entries(input)) {
+    const model = normalizeModel(rawModel);
+    if (!model || !row || typeof row !== 'object') return undefined;
+    const keys = ['totalTokens', ...SESSION_MODEL_COMPONENT_FIELDS];
+    if (keys.some(key => !Number.isSafeInteger(row[key]) || row[key] < 0)) return undefined;
+    if (SESSION_MODEL_COMPONENT_FIELDS.reduce((sum, key) => sum + row[key], 0) > row.totalTokens) return undefined;
+    const target = result[model] ||= Object.fromEntries(keys.map(key => [key, 0]));
+    for (const key of keys) target[key] += row[key];
+  }
+  for (const [model, row] of Object.entries(result)) {
+    if (['totalTokens', ...SESSION_MODEL_COMPONENT_FIELDS].some(key => !Number.isSafeInteger(row[key]))) return undefined;
+    if (row.totalTokens > (session.models[model] || 0)) return undefined;
+  }
+  if (Object.values(result).reduce((sum, row) => sum + row.totalTokens, 0) > session.totalTokens) return undefined;
+  for (const field of SESSION_MODEL_COMPONENT_FIELDS) {
+    if (Object.values(result).reduce((sum, row) => sum + row[field], 0) > session[field]) return undefined;
+  }
+  return Object.keys(result).length ? result : undefined;
+}
+
+function mergeSessionModelComponents(target, source) {
+  if (!source.modelTokenComponents) return;
+  target.modelTokenComponents ||= Object.create(null);
+  for (const [model, row] of Object.entries(source.modelTokenComponents)) {
+    const next = target.modelTokenComponents[model] ||= { totalTokens: 0, inputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0 };
+    for (const key of ['totalTokens', ...SESSION_MODEL_COMPONENT_FIELDS]) next[key] += row[key];
+  }
+}
+
+
 function sessionTokenComponents(input) {
   return {
     inputTokens: Math.max(0, Math.round(firstNumber(input, INPUT_TOKEN_KEYS))),
@@ -677,6 +724,7 @@ function emptySession(client, id) {
 const sessionsWithLiveSource = new WeakSet();
 
 function mergeSession(target, source) {
+  mergeSessionModelComponents(target, source);
   const sourceTokens = Math.max(0, Math.round(asNumber(source.totalTokens)));
   target.totalTokens += sourceTokens;
   target.costUsd += asNumber(source.costUsd);
@@ -707,6 +755,11 @@ function mergeSession(target, source) {
       // Conflicting or missing configuration at the same timestamp is unknown.
       target.reasoningEffort = null;
     }
+  }
+  if (sourceLastUsed >= targetLastUsed) {
+    if (sourceLastUsed > targetLastUsed || !hasOwn(target, 'latestModel')) {
+      if (hasOwn(source, 'latestModel') || hasOwn(target, 'latestModel')) target.latestModel = source.latestModel ?? null;
+    } else if (hasOwn(source, 'latestModel') && target.latestModel !== source.latestModel) target.latestModel = null;
   }
   const sourceProjectId = String(source.projectId || '');
   if (!target.projectId && sourceProjectId) {
@@ -829,6 +882,12 @@ function sessionFromRow(row) {
   applyParentLink(session, row);
   const model = detectModel(row, client);
   if (model && session.totalTokens > 0) session.models[model] = (session.models[model] || 0) + session.totalTokens;
+  if (model && session.totalTokens > 0) {
+    const rowComponents = Object.fromEntries(['totalTokens', 'inputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'outputTokens']
+      .map(key => [key, session[key]]));
+    const components = normalizeSessionModelComponents({ [model]: rowComponents }, session, name => name);
+    if (components) session.modelTokenComponents = components;
+  }
   if (model && session.costUsd > 0) session.modelCosts[model] = (session.modelCosts[model] || 0) + session.costUsd;
   const provider = normalizeProviderName(row.provider);
   if (provider && session.totalTokens > 0) session.providers[provider] = (session.providers[provider] || 0) + session.totalTokens;
@@ -862,6 +921,7 @@ function normalizeSession(input, fallbackKey) {
   );
   session.startedAt = normalizeIsoTimestamp(firstString(input, STARTED_AT_KEYS));
   session.lastUsedAt = normalizeIsoTimestamp(firstString(input, LAST_USED_AT_KEYS));
+  if (hasOwn(input, 'latestModel')) session.latestModel = normalizeLatestModel(input.latestModel, client);
   if (hasOwn(input, 'promptCache')) session.promptCache = normalizePromptCache(input.promptCache);
   if (isSessionReasoningEffortClient(client) && hasOwn(input, 'reasoningEffort')) session.reasoningEffort = normalizeReasoningEffort(input.reasoningEffort);
   session.contextTokens = Math.max(0, Math.round(asNumber(input.contextTokens ?? input.context_tokens ?? 0)));
@@ -902,6 +962,9 @@ function normalizeSession(input, fallbackKey) {
       if (key) session.modelCosts[key] = (session.modelCosts[key] || 0) + asNumber(value);
     }
   }
+  const modelComponents = normalizeSessionModelComponents(input.modelTokenComponents, session,
+    model => normalizeModelNameForClient(model, client));
+  if (modelComponents) session.modelTokenComponents = modelComponents;
   if (input.providers && typeof input.providers === 'object') {
     for (const [provider, value] of Object.entries(input.providers)) {
       const key = normalizeProviderName(provider);
@@ -1320,6 +1383,11 @@ function normalizeDeviceOsName(value) {
   return String(value || '').trim().slice(0, 64);
 }
 
+function historyWithAvailability(history, available) {
+  if (!history || available !== false) return history;
+  return { ...history, summary: { ...history.summary, activeDaysComplete: false } };
+}
+
 // The fields History aggregation reads from a device record, normalized exactly
 // as normalizeDeviceRecord() does. aggregateHistory() used to normalize the whole
 // record for these, which also walks every session of every period: on a long
@@ -1334,7 +1402,8 @@ function normalizeRecordHistoryFields(record, nowIso = new Date().toISOString())
     // An explicit null means History is disabled/unavailable. Preserve that
     // wire distinction; an omitted field means "no History update this tick"
     // and an object is the retained History payload.
-    fields.history = record.history === null ? null : coerceHistory(record.history);
+    fields.history = historyWithAvailability(
+      record.history === null ? null : coerceHistory(record.history), record.historyAvailable);
   }
   if (hasOwn(record, 'periodWindows')) {
     const windows = normalizePeriodWindows(record.periodWindows);
@@ -1358,6 +1427,7 @@ function normalizeDeviceRecord(record) {
     limits: normalizeLimitsSummary(record.limits)
   };
   if (hasOwn(record, 'osName')) normalized.osName = normalizeDeviceOsName(record.osName);
+  if (hasOwn(record, 'deviceKind')) normalized.deviceKind = normalizeDeviceKind(record.deviceKind);
   if (hasOwn(record, 'osVersion')) normalized.osVersion = normalizeDeviceOsVersion(record.osVersion);
   if (hasOwn(record, 'trackedClients')) normalized.trackedClients = normalizeTrackedClients(record.trackedClients);
   if (hasOwn(record, 'clientStatus')) normalized.clientStatus = normalizeClientStatus(record.clientStatus);
@@ -1384,6 +1454,11 @@ function normalizeDeviceRecord(record) {
   if (hasOwn(historyFields, 'historyAvailable')) normalized.historyAvailable = historyFields.historyAvailable;
   if (hasOwn(historyFields, 'history')) normalized.history = historyFields.history;
   if (hasOwn(historyFields, 'periodWindows')) normalized.periodWindows = historyFields.periodWindows;
+  const allTime = record.allTime || record.periods?.allTime;
+  if (record.allTimeTokensUnavailable === true
+    || !Number.isFinite(asNumber(allTime?.totalTokens ?? allTime?.total_tokens, NaN))) {
+    normalized.allTimeTokensUnavailable = true;
+  }
   for (const periodName of PERIODS) {
     normalized.periods[periodName] = normalizePeriod(record[periodName] || record.periods?.[periodName], {
       projectsEnabled: normalized.projectsEnabled !== false
@@ -1530,17 +1605,6 @@ function preserveUntrackedClientUsage(existingRecord, incomingRecord, trackedCli
   }
 }
 
-function limitProviderMergeKey(provider) {
-  const name = String(provider?.provider || '').trim();
-  if (!name) return '';
-  if (GUI_SECRET_LIMIT_PROVIDERS.has(name)) return name;
-  const accountKey = String(provider?.accountKey || '').trim();
-  if (accountKey) return `${name}:${accountKey}`;
-  const accountEmail = String(provider?.accountEmail || '').trim().toLowerCase();
-  if (accountEmail) return `${name}:email:${accountEmail}`;
-  return `${name}:${String(provider?.status || '').trim()}`;
-}
-
 function isConfiguredLimitProvider(provider) {
   return Boolean(provider?.accountKey && provider.status !== 'notConfigured' && provider.status !== 'disabled');
 }
@@ -1552,6 +1616,12 @@ function shouldKeepExistingGuiSecretProvider(existingProvider, incomingProvider,
   if (!isConfiguredLimitProvider(existingProvider)) return false;
   const existingRuntime = String(existingRecord?.agentRuntime || '').trim();
   const incomingRuntime = String(incomingRecord?.agentRuntime || '').trim();
+  // Managed Copilot profiles belong to the widget, even after headless usage
+  // uploads replace the device-level runtime stamp. The widget can still clear
+  // its own profiles explicitly.
+  if (incomingProvider.provider === 'copilot' && existingProvider.sourceDetail === 'managed') {
+    return incomingRuntime === 'headless-agent';
+  }
   return Boolean(existingRuntime && incomingRuntime && existingRuntime !== incomingRuntime);
 }
 
@@ -1560,19 +1630,27 @@ function mergeDeviceLimits(existingRecord, incomingRecord) {
   const incomingLimits = normalizeLimitsSummary(incomingRecord?.limits);
   if (!incomingLimits.providers.length) return incomingLimits;
 
-  const existingByKey = new Map();
-  for (const provider of existingLimits.providers) {
-    const key = limitProviderMergeKey(provider);
-    if (key) existingByKey.set(key, provider);
-  }
-  return {
-    ...incomingLimits,
-    providers: incomingLimits.providers.map((provider) => {
-      const existing = existingByKey.get(limitProviderMergeKey(provider));
-      if (shouldKeepExistingGuiSecretProvider(existing, provider, existingRecord, incomingRecord)) return existing;
-      return provider;
-    })
-  };
+  const retainedProviders = new Set();
+  // An account the incoming summary reports itself is not restored beside it.
+  const incomingAccounts = new Set(incomingLimits.providers.filter(provider => provider.accountKey)
+    .map(provider => `${provider.provider}:${provider.accountKey}`));
+  const providers = incomingLimits.providers.flatMap((provider) => {
+    if (GUI_SECRET_LIMIT_PROVIDERS.has(provider.provider) && provider.status === 'notConfigured') {
+      // Several placeholders for one provider must not each restore the accounts.
+      if (retainedProviders.has(provider.provider)) return [];
+      const retained = existingLimits.providers.filter(existing => existing.provider === provider.provider
+        && !incomingAccounts.has(`${existing.provider}:${existing.accountKey}`)
+        && shouldKeepExistingGuiSecretProvider(existing, provider, existingRecord, incomingRecord));
+      if (!retained.length) return provider;
+      retainedProviders.add(provider.provider);
+      return retained;
+    }
+    return provider;
+  });
+  // A credential-less runtime cannot revoke the signal for accounts it keeps.
+  const multiAccountProviders = [...(incomingLimits.multiAccountProviders || []),
+    ...(existingLimits.multiAccountProviders || []).filter(id => retainedProviders.has(id))];
+  return normalizeLimitsSummary({ ...incomingLimits, multiAccountProviders, providers });
 }
 
 function mergeDeviceRecord(existing, incoming) {
@@ -1584,8 +1662,13 @@ function mergeDeviceRecord(existing, incoming) {
   if (!hasExisting) return normalizedIncoming;
 
   const normalizedExisting = normalizeDeviceRecord(existing);
+  if (!hasOwn(normalizedIncoming, 'deviceKind') && hasOwn(normalizedExisting, 'deviceKind')) {
+    normalizedIncoming.deviceKind = normalizedExisting.deviceKind;
+  }
   if (incoming?.limitsOnly === true) {
     normalizedIncoming.periods = normalizedExisting.periods;
+    delete normalizedIncoming.allTimeTokensUnavailable;
+    if (normalizedExisting.allTimeTokensUnavailable === true) normalizedIncoming.allTimeTokensUnavailable = true;
     // The three attribution fields describe the usage this branch is carrying
     // forward, so they have to travel with it. Scoped to `limitsOnly` on
     // purpose: a full update from an agent too old to send them is stating that
@@ -1616,6 +1699,7 @@ function mergeDeviceRecord(existing, incoming) {
   if (!hasIncomingLimits) normalizedIncoming.limits = normalizedExisting.limits;
   else normalizedIncoming.limits = mergeDeviceLimits(normalizedExisting, normalizedIncoming);
   if (!hasIncomingHistory && hasOwn(normalizedExisting, 'history')) normalizedIncoming.history = normalizedExisting.history;
+  if (hasOwn(normalizedIncoming, 'history')) normalizedIncoming.history = historyWithAvailability(normalizedIncoming.history, normalizedIncoming.historyAvailable);
   if (hasIncomingTrackedClients) {
     preserveUntrackedClientUsage(normalizedExisting, normalizedIncoming, normalizedIncoming.trackedClients || []);
   }
@@ -1746,7 +1830,32 @@ function aggregateHistory(devices, options = {}) {
   let reportedToday = '';
   for (const record of devices) {
     const normalized = normalizeRecordHistoryFields(record);
-    if (!hasOwn(normalized, 'history') || normalized.history === null) continue;
+    const allTime = record.allTime || record.periods?.allTime;
+    let totalTokens = record.allTimeTokensUnavailable === true
+      ? NaN : asNumber(allTime?.totalTokens ?? allTime?.total_tokens, NaN);
+    // Older stored records may have defaulted a missing lifetime counter to zero.
+    if (totalTokens === 0 && ['today', 'month'].some((name) => {
+      const period = record[name] || record.periods?.[name];
+      return asNumber(period?.totalTokens ?? period?.total_tokens) > 0;
+    })) totalTokens = NaN;
+    if (!hasOwn(normalized, 'history') || normalized.history === null) {
+      // A legacy/history-disabled device with unknown or positive usage may own active
+      // dates absent from the histories we can merge. Include an incomplete
+      // sentinel so mixed-version hubs never advertise an exact lifetime count.
+      if (!Number.isFinite(totalTokens) || Math.round(totalTokens) > 0) {
+        histories.push({ daily: [], monthly: [], summary: { activeDaysComplete: false } });
+      }
+      continue;
+    }
+    // A confirmed zero-usage legacy record cannot own any missing active dates.
+    // Missing counters or any retained history evidence still fail closed.
+    const history = normalized.history;
+    if (history.summary.activeDaysComplete !== true
+      && totalTokens === 0
+      && history.daily.length === 0 && history.monthly.length === 0
+      && !history.dailyTotals?.length && !history.dailyTotalsOmitted
+      && asNumber(history.summary.activeDays) === 0
+      && asNumber(history.summary.totalTokens) === 0) continue;
     histories.push(normalized.history);
     if (!normalized.history.daily.length) continue;
     const reported = calendarDayKey(normalized.periodWindows?.today?.key);
@@ -1869,6 +1978,7 @@ function aggregateDevices(devices, staleAfterMs, nowMs = Date.now(), options = {
     aggregate.devices.push({
       deviceId: normalized.deviceId,
       hostname: normalized.hostname,
+      ...(hasOwn(normalized, 'deviceKind') ? { deviceKind: normalized.deviceKind } : {}),
       platform: normalized.platform,
       ...(hasOwn(normalized, 'osName') ? { osName: normalized.osName } : {}),
       ...(hasOwn(normalized, 'osVersion') ? { osVersion: normalized.osVersion } : {}),
@@ -1948,6 +2058,216 @@ function aggregateDevices(devices, staleAfterMs, nowMs = Date.now(), options = {
   return aggregate;
 }
 
+// Sessions re-shelled because Today did not mention them. mergeNormalizedPeriods
+// uses this to renormalize only the sessions a delta actually rebuilt.
+const reusedUnchangedSessions = new WeakSet();
+const deltaResults = new WeakSet();
+// Periods whose session records are already shells, not the anchor's records.
+const shelledPeriods = new WeakSet();
+
+// A session the fresh and anchor Today periods both omit cannot change. The deep
+// walk used to allocate a new object for every nested map anyway, so a watch
+// tick paid for the whole retained history. Copy the session's mutable maps so
+// callers can update the published result without moving the frozen anchor.
+// This avoids the recursive period walk and full normalization of old rows.
+function reuseUnchangedSession(session) {
+  const copy = cloneSessionForMerge(session);
+  reusedUnchangedSessions.add(copy);
+  delete copy.parentSessionId;
+  delete copy.parentClient;
+  applyParentLink(copy, session.parentSessionId ? session : {});
+  if (isSessionReasoningEffortClient(session.client)) {
+    const retainedAt = timestampMs(session.lastUsedAt);
+    // Same branches as deltaValue's session block when fresh and anchor are both
+    // absent: a missing Today row does not clear or move a retained setting.
+    if (retainedAt > 0) {
+      if (hasOwn(session, 'reasoningEffort')) copy.reasoningEffort = normalizeReasoningEffort(session.reasoningEffort);
+      else delete copy.reasoningEffort;
+    } else if (!hasOwn(session, 'reasoningEffort')) delete copy.reasoningEffort;
+  }
+  return copy;
+}
+
+function copyStringMap(map) {
+  return map && typeof map === 'object' ? { ...map } : map;
+}
+
+function copyNullMap(map) {
+  if (!map || typeof map !== 'object') return map;
+  const copy = Object.create(null);
+  return Object.assign(copy, map);
+}
+
+function copyNestedMap(map) {
+  if (!map || typeof map !== 'object') return map;
+  const copy = {};
+  for (const [key, value] of Object.entries(map)) {
+    copy[key] = value && typeof value === 'object' ? { ...value } : value;
+  }
+  return copy;
+}
+
+function copyProjects(projects) {
+  const copy = Object.create(null);
+  for (const [key, project] of Object.entries(projects || {})) {
+    if (!project || typeof project !== 'object') continue;
+    copy[key] = {
+      ...project,
+      clients: project.clients && typeof project.clients === 'object' ? copyNullMap(project.clients) : Object.create(null),
+      ...(project.models && typeof project.models === 'object' ? { models: copyNullMap(project.models) } : {})
+    };
+  }
+  return copy;
+}
+
+function copyThroughput(map) {
+  const copy = Object.create(null);
+  for (const [model, counters] of Object.entries(map)) copy[model] = { ...counters };
+  return copy;
+}
+
+// Own every map addPeriodInto writes, but keep untouched session records shared
+// until a caller asks for a shell. Session identity is detached by detachSessions.
+function adoptNormalizedPeriod(base) {
+  const period = {
+    ...base,
+    capabilities: {
+      tokenComponents: base.capabilities?.tokenComponents === true,
+      throughput: base.capabilities?.throughput === true
+    },
+    clients: copyStringMap(base.clients),
+    clientCosts: copyStringMap(base.clientCosts),
+    clientCacheReads: copyStringMap(base.clientCacheReads),
+    clientCacheWrites: copyStringMap(base.clientCacheWrites),
+    clientOutputs: copyStringMap(base.clientOutputs),
+    clientUnclassifiedTokens: copyStringMap(base.clientUnclassifiedTokens),
+    clientUnpricedTokens: copyStringMap(base.clientUnpricedTokens),
+    models: copyStringMap(base.models),
+    modelCosts: copyStringMap(base.modelCosts),
+    modelCacheReads: copyStringMap(base.modelCacheReads),
+    modelCacheWrites: copyStringMap(base.modelCacheWrites),
+    modelOutputs: copyStringMap(base.modelOutputs),
+    modelUnclassifiedTokens: copyStringMap(base.modelUnclassifiedTokens),
+    modelUnpricedTokens: copyStringMap(base.modelUnpricedTokens),
+    clientModels: copyNestedMap(base.clientModels),
+    clientModelCosts: copyNestedMap(base.clientModelCosts),
+    clientModelUnpricedTokens: copyNestedMap(base.clientModelUnpricedTokens),
+    ...(base.modelThroughput ? { modelThroughput: copyThroughput(base.modelThroughput) } : {}),
+    projects: copyProjects(base.projects),
+    sessions: {}
+  };
+  for (const key of Object.keys(period)) if (period[key] === undefined) delete period[key];
+  return period;
+}
+
+function detachSessions(sessions) {
+  const copy = {};
+  for (const [key, session] of Object.entries(sessions || {})) {
+    copy[key] = session && typeof session === 'object' && session.client && session.sessionId
+      ? reuseUnchangedSession(session)
+      : session;
+  }
+  return copy;
+}
+
+function cloneSessionForMerge(session) {
+  const copy = { ...session };
+  if (sessionsWithLiveSource.has(session)) sessionsWithLiveSource.add(copy);
+  if (session.models && typeof session.models === 'object') copy.models = { ...session.models };
+  if (session.modelCosts && typeof session.modelCosts === 'object') copy.modelCosts = { ...session.modelCosts };
+  if (session.providers && typeof session.providers === 'object') copy.providers = { ...session.providers };
+  if (session.modelTokenComponents && typeof session.modelTokenComponents === 'object') {
+    const components = Object.create(null);
+    for (const [model, row] of Object.entries(session.modelTokenComponents)) {
+      components[model] = row && typeof row === 'object' ? { ...row } : row;
+    }
+    copy.modelTokenComponents = components;
+  }
+  return copy;
+}
+
+function sessionAsMerged(session) {
+  const normalized = normalizeSession(session, sessionKey(session.client, session.sessionId) || undefined);
+  if (!normalized) return null;
+  const merged = emptySession(normalized.client, normalized.sessionId);
+  mergeSession(merged, normalized);
+  return merged;
+}
+
+const OVERLAY_NUMERIC_FIELDS = [
+  'totalTokens', 'costUsd', 'unpricedTokens',
+  'cacheReadTokens', 'cacheWriteTokens', 'outputTokens', 'unclassifiedTokens',
+  'timedTokens', 'timedOutputTokens', 'timedDurationMs'
+];
+const OVERLAY_MAP_FIELDS = [
+  'sessions', 'clients', 'clientCosts', 'clientCacheReads', 'clientCacheWrites',
+  'clientOutputs', 'clientUnclassifiedTokens', 'clientUnpricedTokens',
+  'models', 'modelCosts', 'modelCacheReads', 'modelCacheWrites', 'modelOutputs',
+  'modelUnclassifiedTokens', 'modelUnpricedTokens',
+  'clientModels', 'clientModelCosts', 'clientModelUnpricedTokens',
+  'projects', 'modelThroughput'
+];
+
+// True when addPeriodInto(base, period) can change base. A false capability
+// flag clears provenance, and a missing modelThroughput map deletes the base
+// map; zero counters and empty maps do not. Call this on a normalized period.
+function normalizedOverlayChangesMerge(period) {
+  if (!period || typeof period !== 'object') return false;
+  if (OVERLAY_NUMERIC_FIELDS.some((field) => asNumber(period[field]) !== 0)) return true;
+  if (OVERLAY_MAP_FIELDS.some((field) => {
+    const value = period[field];
+    return Boolean(value && typeof value === 'object' && Object.keys(value).length > 0);
+  })) return true;
+  if (period.capabilities?.tokenComponents === false || period.capabilities?.throughput === false) return true;
+  if (!period.modelThroughput) return true;
+  return false;
+}
+
+// `base` is already normalized. `extra` may be a raw or normalized overlay
+// (WSL, Codex local ledger). The anchor's own session records are never reused
+// as the published summary: a delta has already re-shelled them, and a full
+// scan detaches here. The extra side is the only one passed through normalizePeriod.
+function mergeNormalizedPeriods(base, extra) {
+  if (!base || typeof base !== 'object') return mergePeriods(extra);
+  const target = adoptNormalizedPeriod(base);
+  // A delta result already re-shelled untouched sessions away from the anchor.
+  // Share those shells with the summary. Cloning them again made every watch
+  // tick copy the retained history twice. Sessions the delta rebuilt still have
+  // to pass through normalize+mergeSession, which is what mergePeriods used to
+  // do to the whole period.
+  const fromDelta = deltaResults.has(base);
+  const touched = [];
+  if (fromDelta) {
+    for (const [key, session] of Object.entries(base.sessions || {})) {
+      if (!reusedUnchangedSessions.has(session)) touched.push([key, session]);
+    }
+  }
+  if (fromDelta || shelledPeriods.has(base)) target.sessions = { ...base.sessions };
+  else target.sessions = detachSessions(base.sessions);
+  for (const [key, session] of touched) {
+    const merged = sessionAsMerged(session);
+    if (!merged) {
+      delete target.sessions[key];
+      continue;
+    }
+    const mergedKey = sessionKey(merged.client, merged.sessionId);
+    if (mergedKey && mergedKey !== key) delete target.sessions[key];
+    target.sessions[mergedKey || key] = merged;
+  }
+  if (extra && typeof extra === 'object') {
+    const normalizedExtra = normalizePeriod(extra);
+    if (normalizedOverlayChangesMerge(normalizedExtra)) {
+      for (const session of Object.values(normalizedExtra.sessions || {})) {
+        const key = sessionKey(session.client, session.sessionId);
+        if (key && target.sessions[key]) target.sessions[key] = cloneSessionForMerge(target.sessions[key]);
+      }
+      addPeriodInto(target, normalizedExtra);
+    }
+  }
+  shelledPeriods.add(target);
+  return target;
+}
+
 // Exact broader-period update from a fresh --today scan. Tokens written since the
 // anchor full scan belong to today AND every broader window simultaneously, and
 // session logs are append-only, so base + (freshToday − anchorToday) is an
@@ -1955,8 +2275,11 @@ function aggregateDevices(devices, staleAfterMs, nowMs = Date.now(), options = {
 // rolls past the one it was taken on — callers must run a full scan then.
 // Recurses over the union of keys so it covers every numeric field a period may
 // grow (clients/models/clientModels/sessions/...) without per-field bookkeeping.
+// Subtrees present only on the base are not rebuilt: unchanged sessions are
+// re-shelled once with detached mutable maps.
 function applyPeriodDelta(base, freshToday, anchorToday) {
   const result = deltaValue(base, freshToday, anchorToday, '');
+  if (result && typeof result === 'object') deltaResults.add(result);
   if (result && (!base?.modelThroughput || !freshToday?.modelThroughput || !anchorToday?.modelThroughput)) {
     delete result.modelThroughput;
   }
@@ -1973,6 +2296,7 @@ function deltaValue(base, fresh, anchor, key) {
   // Cache observations are snapshots, never additive accounting. Missing
   // metadata retains the base; only an explicit null clears an observation.
   if (key === 'promptCache') return fresh === undefined ? base : normalizePromptCache(fresh);
+  if (key === 'latestModel') return fresh === undefined ? base : fresh;
   if (key === 'reasoningEffort') return fresh === undefined ? base : normalizeReasoningEffort(fresh);
   if (key === 'tokenComponents') {
     // A warm tick may introduce aggregate-only fallback data. Boolean
@@ -1998,11 +2322,17 @@ function deltaValue(base, fresh, anchor, key) {
     if (baseMs && freshMs) return baseMs >= freshMs ? base : fresh;
     return base || fresh || '';
   }
-  const sample = [base, fresh, anchor].find((value) => value !== undefined && value !== null);
+  if (base != null && fresh == null && anchor == null && typeof base === 'object' && !Array.isArray(base)) {
+    if (base.client && base.sessionId) return reuseUnchangedSession(base);
+    return base;
+  }
+  const sample = base ?? fresh ?? anchor;
   if (typeof sample === 'number') return Math.max(0, asNumber(base) + asNumber(fresh) - asNumber(anchor));
   if (typeof sample === 'string') return base ?? fresh;
   if (sample && typeof sample === 'object') {
-    const keys = new Set([...Object.keys(base || {}), ...Object.keys(fresh || {}), ...Object.keys(anchor || {})]);
+    const keys = fresh == null && anchor == null
+      ? Object.keys(base || {})
+      : new Set([...Object.keys(base || {}), ...Object.keys(fresh || {}), ...Object.keys(anchor || {})]);
     const result = Object.getPrototypeOf(sample) === null ? Object.create(null) : {};
     for (const childKey of keys) {
       result[childKey] = deltaValue(
@@ -2016,9 +2346,33 @@ function deltaValue(base, fresh, anchor, key) {
     // the base pair intact; the collector's fresh-link gate decides whether
     // to replace it. Field-wise fallback can invent a cross-provider parent.
     if (sample.client && sample.sessionId) {
+      // Component coverage is optional. A mixed legacy/partial anchor cannot
+      // establish the per-model delta; do not subtract a missing reading as zero.
+      if (result.modelTokenComponents && (asNumber(fresh?.totalTokens) > 0 || asNumber(anchor?.totalTokens) > 0)) {
+        const complete = [base, fresh, anchor].every(session => !session || asNumber(session.totalTokens) === 0
+          || Object.entries(session.models || {}).every(([model, tokens]) => tokens === 0
+            || session.modelTokenComponents?.[model]?.totalTokens === tokens));
+        const models = new Set([base, fresh, anchor].flatMap(session => Object.keys(session?.modelTokenComponents || {})));
+        const exact = complete && [...models].every(model =>
+          ['totalTokens', 'inputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'outputTokens'].every(field =>
+            (base?.modelTokenComponents?.[model]?.[field] || 0)
+            + (fresh?.modelTokenComponents?.[model]?.[field] || 0)
+            - (anchor?.modelTokenComponents?.[model]?.[field] || 0) >= 0));
+        const components = exact && normalizeSessionModelComponents(result.modelTokenComponents, result,
+          model => normalizeModelNameForClient(model, result.client));
+        if (components) result.modelTokenComponents = components;
+        else delete result.modelTokenComponents;
+      }
+
       delete result.parentSessionId;
       delete result.parentClient;
       applyParentLink(result, base?.parentSessionId ? base : fresh || {});
+      const freshModelAt = timestampMs(fresh?.lastUsedAt);
+      const retainedModelAt = timestampMs(base?.lastUsedAt);
+      if (freshModelAt < retainedModelAt) {
+        if (hasOwn(base || {}, 'latestModel')) result.latestModel = base.latestModel;
+        else delete result.latestModel;
+      } else if (!hasOwn(fresh || {}, 'latestModel') && freshModelAt > retainedModelAt) result.latestModel = null;
       // Compare before lastUsedAt is projected to the maximum: a missing
       // setting preserves only the same observation, never a newer turn.
       if (isSessionReasoningEffortClient(sample.client)) {
@@ -2042,6 +2396,7 @@ module.exports = {
   PERIODS,
   UNATTRIBUTED_USAGE_CLIENT,
   addPeriodInto,
+  isPeriodExpired,
   aggregateDevices,
   aggregateHistory,
   applyPeriodDelta,
@@ -2052,11 +2407,13 @@ module.exports = {
   extractUsageBundleFromTokscale,
   extractUsageFromTokscale,
   mergeDeviceRecord,
+  mergeNormalizedPeriods,
   mergeSyncDeviceRecord,
   mergePeriods,
   normalizeClientName,
   normalizeModelName,
   normalizeModelNameForClient,
+  normalizeLatestModel,
   normalizeDeviceRecord,
   normalizePeriod,
   projectRollupFromSessions,

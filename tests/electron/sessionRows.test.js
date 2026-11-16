@@ -1,4 +1,6 @@
 'use strict';
+// Presentation doubles delegate child commits; native fixtures exercise reconciliation.
+const rendererDom = { clear: node => node.replaceChildren(), reconcileChildren: (node, nodes) => node.replaceChildren(...nodes), placeChildren: (node, nodes) => node.replaceChildren(...nodes) };
 
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -278,58 +280,9 @@ test('session rows carry the model tooltip entries behind the "N models" label',
   ]);
 });
 
-test('a hovered background-review run tooltip holds the session repaint', () => {
-  // The periodic rebuild of an open review detail replaces every run node;
-  // sessionTooltipShouldHoldRender is what keeps a tooltip open through it.
-  // The guard's selector must cover the run title, which carries the wrap
-  // class itself — matching only the Sessions list's containers would leave
-  // this surface unprotected.
-  const source = fs.readFileSync(path.join(__dirname, '../../src/electron/renderer/app.js'), 'utf8');
-  const body = source.slice(
-    source.indexOf('function sessionTooltipShouldHoldRender('),
-    source.indexOf('function flushPendingLimitDetailTooltipRender(')
-  );
-  const matchesPart = (part, el) => {
-    const compounds = part.trim().split(/\s+/);
-    const [cls, ...pseudos] = compounds.at(-1).split(':');
-    if (!cls.split('.').filter(Boolean).every((c) => el.classes.includes(c))) return false;
-    if (pseudos.includes('hover') && !el.hovered) return false;
-    if (pseudos.includes('focus-within') && !el.focusWithin) return false;
-    let anc = el.parent;
-    for (let i = compounds.length - 2; i >= 0; i -= 1) {
-      const required = compounds[i].split('.').filter(Boolean);
-      while (anc && !required.every((c) => anc.classes.includes(c))) anc = anc.parent;
-      if (!anc) return false;
-      anc = anc.parent;
-    }
-    return true;
-  };
-  const document = {
-    element: null,
-    querySelector(selector) {
-      return this.element && selector.split(',').some((part) => matchesPart(part, this.element))
-        ? this.element
-        : null;
-    }
-  };
-  const shouldHold = Function('document', `${body}\nreturn sessionTooltipShouldHoldRender;`)(document);
 
-  for (const flag of ['hovered', 'focusWithin']) {
-    document.element = { classes: ['detail-ex-title', 'limit-detail-tooltip-wrap'], [flag]: true, parent: null };
-    assert.equal(shouldHold(), true);
-  }
-  document.element = { classes: ['detail-ex-title', 'limit-detail-tooltip-wrap'], parent: null };
-  assert.equal(shouldHold(), false);
-});
 
-test('the periodic review-detail rebuild defers to the tooltip hold', () => {
-  const source = fs.readFileSync(path.join(__dirname, '../../src/electron/renderer/app.js'), 'utf8');
-  const branch = source.slice(
-    source.indexOf("state.openSession.kind === 'session-group'"),
-    source.indexOf('state.openSession.renderOptions')
-  );
-  assert.match(branch, /!sessionTooltipShouldHoldRender\(\)/);
-});
+
 
 test('Codex merged rollout labels contain UUIDs only', () => {
   const first = '01a084ff-20ff-7563-beb4-045b31e5a47a';
@@ -686,17 +639,17 @@ function groupMemberRenderer(onOpen = () => {}) {
   const source = fs.readFileSync(path.join(__dirname, '../../src/electron/renderer/app.js'), 'utf8');
   const body = source.slice(source.indexOf('function sessionGroupRunNode('), source.indexOf('function renderSessionGroupDetail('));
   const api = require('../../src/electron/renderer/sessionRows');
-  return Function('rowTemplate', 'updateRow', 'sessionRowsApi', 't', 'openSessionDetail',
+  return Function('rowTemplate', 'updateRow', 'sessionRowsApi', 't', 'openSessionDetail', 'window',
     `${body}\nreturn sessionGroupRunNode;`)(
-    data => ({ data, events: {}, classes: new Set(['row']),
+    data => ({ data, dataset: {}, events: {}, classes: new Set(['row']),
       classList: { add() {} },
       addEventListener(type, handler) { this.events[type] = handler; },
-      click() { this.events.click?.(); },
+      click() { this.events.click?.({ currentTarget: this }); },
       closest() { return this.interactive ? this : null; }
     }),
     (node, data) => { node.data = data; node.interactive = api.sessionRowDetailAvailable(data); },
     api, key => ({ 'sessions.mainSession': '主會話', 'sessions.subagent': '子代理',
-      'sessions.backgroundReviews': 'Codex Auto Review' })[key] || key, onOpen
+      'sessions.backgroundReviews': 'Codex Auto Review' })[key] || key, onOpen, { TokenMonitorDomReconcile: require('../../src/electron/renderer/domReconcile') }
   );
 }
 
@@ -1215,17 +1168,31 @@ test('an archived session is never running and a half-read context is not shown'
 
 test('session rows keep a completed session cache when the recent context expires in every period', () => {
   const at = Date.parse('2026-09-30T09:00:00Z');
-  const session = { client: 'codex', sessionId: 'cache-session', totalTokens: 100, lastUsedAt: new Date(at).toISOString(), turnEnded: true,
-    contextTokens: 60, contextWindow: 100, promptCache: { observedAt: new Date(at).toISOString(), ttlSeconds: 1800 } };
+  const session = { client: 'claude', sessionId: 'cache-session', totalTokens: 100, lastUsedAt: new Date(at).toISOString(), turnEnded: true,
+    contextTokens: 60, contextWindow: 100, promptCache: { observedAt: new Date(at).toISOString(), ttlSeconds: 3600 } };
   for (const period of ['today', 'month', 'allTime']) {
     const before = sessionRowsForPeriod({ sessions: { cache: session } }, { now: new Date(at + 600_000) })[0];
     assert.equal(before.context.percentUsed, 60, period);
     const after = sessionRowsForPeriod({ sessions: { cache: session } }, { now: new Date(at + 600_001) })[0];
     assert.equal(after.context, undefined, period);
-    assert.equal(after.promptCache.minutes, 20, period);
+    assert.equal(after.promptCache.minutes, 50, period);
     assert.equal(after.contextSnapshot.contextTokens, 60, period);
     assert.equal(after.contextSnapshot.contextWindow, 100, period);
-    assert.equal(sessionRowsForPeriod({ sessions: { cache: session } }, { now: new Date(at + 1800_000) })[0].promptCache, null, period);
+    assert.equal(sessionRowsForPeriod({ sessions: { cache: session } }, { now: new Date(at + 3600_000) })[0].promptCache, null, period);
+  }
+});
+
+test('session rows suppress legacy Codex cache countdowns in every period', () => {
+  const at = Date.parse('2026-09-30T09:00:00Z');
+  const session = { client: 'codex', sessionId: 'legacy', totalTokens: 100, lastUsedAt: new Date(at).toISOString(),
+    contextTokens: 60, contextWindow: 100, promptCache: { observedAt: new Date(at).toISOString(), ttlSeconds: 1800 } };
+  for (const period of ['today', 'month', 'allTime']) {
+    const stats = { periods: { [period]: { sessions: { legacy: session } } } };
+    for (const elapsed of [0, 600_001]) {
+      const row = sessionRowsForPeriod(stats.periods[period], { now: new Date(at + elapsed) })[0];
+      assert.equal(row.promptCache, null, period);
+      assert.equal(row.contextSnapshot.contextTokens, 60, period);
+    }
   }
 });
 
@@ -1264,7 +1231,6 @@ test('the shared metrics slot restores its meter and tone after cache or empty s
   assert.equal(gauge.title, undefined);
   assert.deepEqual(gauge.entries, []);
 });
-
 
 test('Grok Bot groups all bot conversations by latest activity and conserves totals', () => {
   const now = new Date(2026, 4, 30, 12, 30);
@@ -1346,22 +1312,21 @@ test('Grok group rows expose usage without an unsupported transcript action', ()
   assert.deepEqual(node.events, {});
 });
 
-
 test('group sections keep main continuations above children without changing usage or counting runs as agents', () => {
   const source = fs.readFileSync(path.join(__dirname, '../../src/electron/renderer/app.js'), 'utf8');
   const body = source.slice(source.indexOf('function renderSessionGroupDetail('), source.indexOf('function detailNote('));
-  const node = () => ({ children: [], selectors: new Map(), classList: { add() {}, remove() {} },
+  const node = () => ({ children: [], dataset: {}, get childNodes() { return this.children; }, selectors: new Map(), classList: { add() {}, remove() {} },
     replaceChildren(...items) { this.children = items; }, append(...items) { this.children.push(...items); },
     setAttribute() {}, addEventListener() {}, querySelector(selector) {
       if (!this.selectors.has(selector)) this.selectors.set(selector, {});
       return this.selectors.get(selector);
     }
   });
-  const els = { breakdown: node(), sessionDetail: node(), sessionDetailHead: node() };
+  const els = { sessionToolFilter: node(), breakdown: node(), sessionDetail: node(), sessionDetailHead: node() };
   const render = Function('els', 'document', 't', 'closeSessionDetail', 'bindHoverMarquee',
-    'detailNote', 'formatNumber', 'formatCost', 'sessionGroupRunNode', `${body}\nreturn renderSessionGroupDetail;`)(
+    'detailNote', 'formatNumber', 'formatCost', 'sessionGroupRunNode', 'rendererDom', `${body}\nreturn renderSessionGroupDetail;`)(
     els, { createElement: node }, key => ({ 'sessions.mainSession': '主會話', 'sessions.subagent': '子代理' })[key] || key,
-    () => {}, () => {}, node, String, String, (row, max) => ({ row, max }));
+    () => {}, () => {}, node, String, String, (row, max) => ({ row, max }), rendererDom);
   const main = { key: 'main-1', groupRole: 'main', value: 40 };
   const continuation = { key: 'main-2', groupRole: 'main', value: 30 };
   const child = { key: 'child-1', groupRole: 'subagent', value: 20 };

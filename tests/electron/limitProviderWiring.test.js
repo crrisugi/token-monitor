@@ -89,6 +89,7 @@ test('CREDENTIAL_SETTING_PATHS is exactly this set (the store is default-deny)',
   assert.deepEqual(CREDENTIAL_SETTING_PATHS, {
     hubHostSecret: ['hub', 'hostSecret'],
     secret: ['hub', 'clientSecret'],
+    hubProfiles: ['hub', 'profiles'],
     claudeWebCookie: ['providers', 'claude', 'webCookie'],
     opencodeCookie: ['providers', 'opencode', 'cookie'],
     opencodeProfiles: ['providers', 'opencode', 'profiles'],
@@ -97,19 +98,29 @@ test('CREDENTIAL_SETTING_PATHS is exactly this set (the store is default-deny)',
     kimiApiKey: ['providers', 'kimi', 'apiKey'],
     kimiWebAccessToken: ['providers', 'kimi', 'webAccessToken'],
     copilotApiToken: ['providers', 'copilot', 'apiToken'],
+    copilotProfiles: ['providers', 'copilot', 'profiles'],
     zedCookie: ['providers', 'zed', 'cookie'],
+    mistralCookie: ['providers', 'mistral', 'cookie'],
     typesafeCookie: ['providers', 'typesafe', 'cookie'],
     stepfunToken: ['providers', 'stepfun', 'token'],
     notionCookie: ['providers', 'notion', 'cookie'],
+    opendesignCookie: ['providers', 'opendesign', 'cookie'],
+    manusSessionToken: ['providers', 'manus', 'sessionToken'],
+    harkCookie: ['providers', 'hark', 'cookie'],
+    museWebCookie: ['providers', 'muse', 'webCookie'],
     commandcodeCookie: ['providers', 'commandcode', 'cookie'],
     zaiApiKey: ['providers', 'zai', 'apiKey'],
     zaiTeamApiKey: ['providers', 'zaiTeam', 'apiKey'],
     zaiTeamOrganizationId: ['providers', 'zaiTeam', 'organizationId'],
     zaiTeamProjectId: ['providers', 'zaiTeam', 'projectId'],
     qoderCookie: ['providers', 'qoder', 'cookie'],
+    qoderAccountSlots: ['providers', 'qoder', 'accountSlots'],
     devinBearerToken: ['providers', 'devin', 'bearerToken'],
     deepseekApiKey: ['providers', 'deepseek', 'apiKey'],
+    deepseekWebToken: ['providers', 'deepseek', 'webToken'],
+    deepseekAccountSlots: ['providers', 'deepseek', 'accountSlots'],
     openrouterProfiles: ['providers', 'openrouter', 'profiles'],
+    minimaxApiProfiles: ['providers', 'minimax', 'profiles'],
     minimaxApiKey: ['providers', 'minimax', 'apiKey'],
     volcengineAccessKeyId: ['providers', 'volcengine', 'accessKeyId'],
     volcengineSecretAccessKey: ['providers', 'volcengine', 'secretAccessKey'],
@@ -117,6 +128,7 @@ test('CREDENTIAL_SETTING_PATHS is exactly this set (the store is default-deny)',
     volcengineAgentSecretAccessKey: ['providers', 'volcengine', 'agentSecretAccessKey'],
     ollamaApiKey: ['providers', 'ollama', 'apiKey'],
     ollamaCookie: ['providers', 'ollama', 'cookie'],
+    traeCookie: ['providers', 'trae', 'cookie'],
     traeAccessToken: ['providers', 'trae', 'accessToken'],
     traeDeviceId: ['providers', 'trae', 'deviceId'],
     alibabaCookie: ['providers', 'alibaba', 'cookie'],
@@ -126,7 +138,7 @@ test('CREDENTIAL_SETTING_PATHS is exactly this set (the store is default-deny)',
 
 test('every provider credential path lives under providers/<id>', () => {
   for (const [key, segments] of Object.entries(CREDENTIAL_SETTING_PATHS)) {
-    if (key === 'hubHostSecret' || key === 'secret') continue;
+    if (key === 'hubHostSecret' || key === 'secret' || key === 'hubProfiles') continue;
     assert.equal(segments[0], 'providers', key);
     assert.equal(segments.length, 3, key);
   }
@@ -145,34 +157,39 @@ test('the renderer receives no credential values except the two hub secrets', ()
 
 test('LIMIT_PROVIDER_SETTING_KEYS is exactly this set (drives per-provider refresh scopes)', () => {
   assert.deepEqual(LIMIT_PROVIDER_SETTING_KEYS, {
-    claude: ['claudeWebCookie', 'claudeWebOrganizationId'],
+    claude: ['claudeWebCookie', 'claudeWebOrganizationId', 'claudeCliFallbackEnabled'],
     codex: ['codexManagedAccounts'],
     opencode: ['opencodeCookie', 'opencodeProfiles', 'opencodeLocalLimitsEnabled'],
     cursor: ['cursorDisabledAccountIds'],
     cline: ['clineApiKey'],
     factory: ['factoryApiKey'],
     kimi: ['kimiApiKey', 'kimiWebAccessToken'],
-    copilot: ['copilotApiToken', 'copilotEnterpriseHost'],
+    copilot: ['copilotProfiles', 'copilotApiToken', 'copilotEnterpriseHost'],
     zed: ['zedCookie'],
     commandcode: ['commandcodeCookie'],
     mimo: ['mimoManagedAccounts'],
     zai: ['zaiApiKey', 'zaiApiRegion'],
     zaiteam: ['zaiTeamApiKey', 'zaiTeamOrganizationId', 'zaiTeamProjectId'],
     workbuddy: ['workbuddyAccessToken', 'workbuddyUserId', 'workbuddyEnterpriseId', 'workbuddyLocale', 'workbuddyDomain', 'workbuddyDepartmentInfo'],
-    qoder: ['qoderCookie', 'qoderSite'],
-    deepseek: ['deepseekApiKey'],
+    qoder: ['qoderCookie', 'qoderSite', 'qoderAccountSlots'],
+    deepseek: ['deepseekApiKey', 'deepseekWebToken', 'deepseekAccountSlots'],
     devin: ['devinBearerToken', 'devinOrganization'],
+    mistral: ['mistralCookie'],
     typesafe: ['typesafeCookie'],
     stepfun: ['stepfunToken'],
     notion: ['notionCookie', 'notionWorkspaceId'],
+    opendesign: ['opendesignCookie'],
+    manus: ['manusSessionToken'],
+    hark: ['harkCookie'],
+    muse: ['museWebCookie'],
     openrouter: ['openrouterProfiles'],
-    minimax: ['minimaxApiKey', 'minimaxApiRegion', 'minimaxBillingMode'],
+    minimax: ['minimaxApiProfiles', 'minimaxApiKey', 'minimaxApiRegion', 'minimaxBillingMode'],
     volcengine: [
       'volcengineAccessKeyId', 'volcengineSecretAccessKey', 'volcengineRegion',
       'volcengineAgentAccessKeyId', 'volcengineAgentSecretAccessKey', 'volcengineAgentRegion'
     ],
     ollama: ['ollamaApiKey', 'ollamaCookie'],
-    trae: ['traeAccessToken', 'traeDeviceId'],
+    trae: ['traeCookie', 'traeAccessToken', 'traeDeviceId'],
     alibaba: ['alibabaCookie', 'alibabaVariant'],
     thirdparty: ['thirdPartyProfiles']
   });
@@ -273,14 +290,14 @@ test('settings:update normalizes provider fields and strips separately managed a
   const fields = LIMIT_PROVIDER_REGISTRY.flatMap(({ fields }) => fields);
   const normalizedKeys = fields.filter(({ normalize, persist }) => normalize && persist !== 'never').map(({ key }) => key);
   assert.deepEqual(normalizedKeys.sort(), [
-    'claudeWebCookie', 'claudeWebOrganizationId', 'deepseekApiKey', 'minimaxApiKey', 'minimaxApiRegion', 'minimaxBillingMode', 'copilotApiToken', 'copilotEnterpriseHost',
+    'claudeWebCookie', 'claudeWebOrganizationId', 'deepseekApiKey', 'deepseekWebToken', 'minimaxApiKey', 'minimaxApiRegion', 'minimaxBillingMode', 'copilotApiToken', 'copilotEnterpriseHost',
     'factoryApiKey', 'clineApiKey', 'zaiApiKey', 'zaiApiRegion', 'zaiTeamApiKey',
     'zaiTeamOrganizationId', 'zaiTeamProjectId', 'volcengineAccessKeyId',
     'volcengineSecretAccessKey', 'volcengineRegion', 'volcengineAgentAccessKeyId',
     'volcengineAgentSecretAccessKey', 'volcengineAgentRegion', 'qoderCookie', 'qoderSite',
     'devinBearerToken', 'devinOrganization', 'alibabaCookie', 'alibabaVariant',
-    'traeAccessToken', 'traeDeviceId', 'zedCookie', 'typesafeCookie', 'stepfunToken',
-    'commandcodeCookie', 'kimiApiKey', 'kimiWebAccessToken', 'ollamaApiKey', 'ollamaCookie', 'notionCookie', 'notionWorkspaceId'
+    'traeCookie', 'traeAccessToken', 'traeDeviceId', 'zedCookie', 'typesafeCookie', 'stepfunToken',
+    'mistralCookie', 'commandcodeCookie', 'kimiApiKey', 'kimiWebAccessToken', 'ollamaApiKey', 'ollamaCookie', 'notionCookie', 'notionWorkspaceId', 'manusSessionToken', 'harkCookie', 'museWebCookie', 'opendesignCookie'
   ].sort());
   for (const key of normalizedKeys) {
     const value = key === 'claudeWebCookie' ? 'sessionKey=sk-ant-test'
@@ -318,6 +335,20 @@ test('settings:update normalizes provider fields and strips separately managed a
   }
 });
 
+test('generic settings updates cannot reclassify discovered Cursor accounts as manual', () => {
+  const start = mainSource.indexOf('    const normalizedPatch = { ...patch, currency: normalizedCurrency };');
+  const end = mainSource.indexOf('    normalizeAccountPatch(patch, normalizedPatch);', start);
+  const stored = { cursorManualAccountIds: ['user_MANUAL'] };
+  const patch = { cursorManualAccountIds: ['user_STALE'], cursorDisabledAccountIds: ['user_DISABLED'] };
+  const normalized = vm.runInNewContext(`${mainSource.slice(start, end)}; normalizedPatch`, {
+    patch, normalizedCurrency: 'USD'
+  });
+  const saved = { ...stored, ...normalized };
+  assert.deepEqual(saved.cursorManualAccountIds, ['user_MANUAL']);
+  assert.deepEqual(saved.cursorDisabledAccountIds, ['user_DISABLED']);
+  assert.deepEqual(patch.cursorManualAccountIds, ['user_STALE']);
+});
+
 test('the external URL allowlist admits exactly the provider consoles it should', () => {
   const isAllowedExternalUrl = evalTopLevel(
     mainSource,
@@ -330,7 +361,7 @@ test('the external URL allowlist admits exactly the provider consoles it should'
       isAllowedVerificationUrl,
       isAllowedCodexLoginUrl,
       limitProviderUrlAllowed,
-      STATUS_PAGE_HOSTS: new Set(SERVICE_STATUS_PROVIDERS.map((provider) => new URL(provider.pageUrl).hostname))
+      STATUS_PAGE_HOSTS: evalTopLevel(mainSource, 'const STATUS_PAGE_HOSTS = ', '\nconst diagnosticJournal', { URL, SERVICE_STATUS_PROVIDERS })
     }
   );
   const allowed = [
@@ -338,6 +369,10 @@ test('the external URL allowlist admits exactly the provider consoles it should'
     'https://claude.ai/settings/billing',
     'https://cursor.com/settings',
     'https://www.cursor.com/settings',
+    'https://cursor.com/',
+    'https://www.cursor.com/',
+    'https://cursor.com/dashboard',
+    'https://www.cursor.com/dashboard',
     'https://opencode.ai/',
     'https://www.opencode.ai/auth',
     'https://openrouter.ai/settings/keys',
@@ -371,6 +406,14 @@ test('the external URL allowlist admits exactly the provider consoles it should'
     'https://status.openai.com/',
     'https://status.cursor.com/',
     'https://status.deepseek.com/',
+    'https://www.githubstatus.com/',
+    'https://status.moonshot.cn/',
+    'https://status.minimaxi.com/',
+    'https://status.minimax.io/',
+    'https://status.opencode.ai/',
+    'https://status.zed.dev/',
+    'https://www.devinstatus.com/',
+    'https://status.factory.ai/',
     'https://github.com/junhoyeo/tokscale',
     'https://github.com/Javis603/token-monitor/releases',
     'https://www.npmjs.com/package/@tokscale/cli',
@@ -378,10 +421,29 @@ test('the external URL allowlist admits exactly the provider consoles it should'
     'https://www.javis-ai.com/token-monitor/'
   ];
   for (const url of allowed) assert.equal(isAllowedExternalUrl(url), true, url);
+
+  const cursorLoginStart = appSource.indexOf("  document.getElementById('cursorLoginButton').addEventListener");
+  const cursorLoginEnd = appSource.indexOf('\n  });', cursorLoginStart) + '\n  });'.length;
+  let cursorLogin;
+  const cursorUrls = [];
+  vm.runInNewContext(appSource.slice(cursorLoginStart, cursorLoginEnd), {
+    document: { getElementById: () => ({ addEventListener: (_event, handler) => { cursorLogin = handler; } }) },
+    window: { tokenMonitor: { openExternal: (url) => {
+      assert.equal(isAllowedExternalUrl(url), true, 'the Cursor login button must pass the main-process URL policy');
+      cursorUrls.push(url);
+    } } }
+  });
+  cursorLogin();
+  assert.deepEqual(cursorUrls, ['https://cursor.com']);
+
   const denied = [
     'https://claude.ai/',
     'https://claude.ai/login',
-    'https://cursor.com/',
+    'https://cursor.com/other',
+    'https://cursor.com/dashboard-other',
+    'https://cursor.com/dashboard/other',
+    'https://cursor.com.evil.com/dashboard',
+    'http://cursor.com/dashboard',
     'https://openrouter.ai/',
     'https://openrouter.ai/settings',
     'https://platform.deepseek.com/',
@@ -396,6 +458,8 @@ test('the external URL allowlist admits exactly the provider consoles it should'
     'https://bailian.console.aliyun.com/',
     'https://bailian.console.aliyun.com/us-west-1',
     'https://status.claude.com/incidents',
+    'https://www.google.com/appsstatus/dashboard',
+    'https://www.google.com/appsstatus/dashboard/other',
     'https://codex-resets.com/path',
     'https://github.com/junhoyeo',
     'https://github.com/Javis603/other-repo',
@@ -425,6 +489,17 @@ test('account projections redact secrets while preserving profile metadata and s
   const status = accountStatusProjection({ clineApiKey: 'stored' }, { CLINE_API_KEY: 'environment' });
   assert.equal(status.clineCredentialConfigured, true);
   assert.equal(status.clineCredentialSource, 'settings');
+});
+
+test('MiniMax profiles keep the legacy configured flag truthful', () => {
+  const profiles = accountStatusProjection({ minimaxApiProfiles: { work: { apiKey: 'saved-secret', billingMode: 'api' } } }, {});
+  assert.equal(profiles.minimaxApiKeyConfigured, true);
+  assert.equal(profiles.minimaxApiKeySource, 'settings');
+  for (const env of [{}, { MINIMAX_CODING_API_KEY: 'env-secret' }]) {
+    const disabled = accountStatusProjection({ minimaxApiProfiles: { work: { apiKey: 'saved-secret', enabled: false } } }, env);
+    assert.equal(disabled.minimaxApiKeyConfigured, false);
+    assert.equal(disabled.minimaxApiKeySource, '');
+  }
 });
 
 test('the renderer receives serializable account forms but no credential declarations', () => {
@@ -515,12 +590,12 @@ test('static account statuses refresh in both paths while descriptor panels use 
 test('every provider with an account panel has its group and status markup in index.html', () => {
   const nodes = evalTopLevel(appSource, 'const LIMIT_PROVIDER_ACCOUNT_NODES = {', '\nconst LIMIT_PROVIDER_CONNECTION_DETAIL_KEYS');
   const groupIds = Object.fromEntries(Object.entries(nodes).map(([provider, node]) => [provider, node.group]));
-  // Not every catalog provider has a hand-written panel: grok, muse and kiro
+  // Not every catalog provider has a hand-written panel: grok and kiro
   // take their credentials from the tool itself, and the account-form providers
   // get theirs generated. The map is the list of those whose markup is static.
   assert.deepEqual(
     LIMIT_PROVIDER_IDS.filter((provider) => !groupIds[provider]).sort(),
-    ['grok', 'muse', 'kiro', ...limitAccountFormsForRenderer().map(({ id }) => id)].sort()
+    ['grok', 'kiro', ...limitAccountFormsForRenderer().map(({ id }) => id)].sort()
   );
   for (const [provider, id] of Object.entries(groupIds)) {
     assert.ok(LIMIT_PROVIDER_IDS.includes(provider), `${provider} is a catalog id`);
@@ -550,10 +625,10 @@ test('MiniMax implicit region remains env-driven after unrelated saves and reloa
   assert.deepEqual(change.limitScopes, [{ provider: 'minimax' }]);
   assert.equal(change.usageStructural, false);
   const { settingsLimitInvalidationPlan } = require('../../src/electron/deviceRuntimeCoordinator');
-  assert.deepEqual(settingsLimitInvalidationPlan(change), [{ scope: { provider: 'minimax' }, reason: 'settings-change', options: { clear: true } }]);
+  assert.deepEqual(settingsLimitInvalidationPlan(change), [{ scope: { provider: 'minimax', source: 'api' }, reason: 'settings-change', options: { clear: true } }]);
 });
 
-test('MiniMax billing choice survives reload and clears only its provider quota', () => {
+test('MiniMax key billing choice survives reload and invalidates only its API source', () => {
   const { initialAccountSettings } = require('../../src/electron/limits/accountSettings');
   assert.equal(initialAccountSettings({}).minimaxBillingMode, 'token-plan');
   assert.equal(limitsConfigFromSettings({}, { env: {} }).minimaxBillingMode, 'token-plan');
@@ -570,5 +645,19 @@ test('MiniMax billing choice survives reload and clears only its provider quota'
   assert.deepEqual(change.limitScopes, [{ provider: 'minimax' }]);
   assert.equal(change.usageStructural, false);
   const { settingsLimitInvalidationPlan } = require('../../src/electron/deviceRuntimeCoordinator');
-  assert.deepEqual(settingsLimitInvalidationPlan(change), [{ scope: { provider: 'minimax' }, reason: 'settings-change', options: { clear: true } }]);
+  assert.deepEqual(settingsLimitInvalidationPlan(change), [{ scope: { provider: 'minimax', source: 'api' }, reason: 'settings-change', options: { clear: true } }]);
+});
+
+test('Trae credential source follows the usable credential after a malformed stored value', () => {
+  for (const [key, envKey] of [['traeCookie', 'TRAE_COOKIE'], ['traeAccessToken', 'TRAE_ACCESS_TOKEN']]) {
+    const settings = { [key]: 'invalid\r\ncredential' };
+    const fallback = accountStatusProjection(settings, { [envKey]: 'usable-env-credential' });
+    assert.equal(fallback.traeAccessTokenConfigured, true);
+    assert.equal(fallback.traeAccessTokenSource, 'env');
+    const missing = accountStatusProjection(settings, {});
+    assert.equal(missing.traeAccessTokenConfigured, false);
+    assert.equal(missing.traeAccessTokenSource, '');
+    const saved = accountStatusProjection({ [key]: 'usable-stored-credential' }, { [envKey]: 'usable-env-credential' });
+    assert.equal(saved.traeAccessTokenSource, 'settings');
+  }
 });

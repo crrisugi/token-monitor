@@ -36,6 +36,40 @@ function qoderUsageUrl(site = 'global') {
   return `${qoderOrigin(site)}/api/v2/me/usages/big_model_credits`;
 }
 
+// The account's own id is the only part of a Qoder session that survives a
+// sign-in. The cookie jar is mostly analytics (`_ga`, `_fbp`, `_uetsid`) and a
+// session token that rotates, so hashing the whole jar renames the account on
+// every re-login and forks its stored quota history. Both the usage payload and
+// the `qoderuid` cookie carry the id; keep the cookie hash only as an alias for
+// readings recorded before the id was used.
+function qoderPayloadUserId(body) {
+  const payload = body?.data && typeof body.data === 'object' ? body.data : body;
+  return String(read(payload, 'userId', 'user_id') || '').trim();
+}
+
+function qoderCookieUserId(cookie) {
+  for (const part of String(cookie || '').split(';')) {
+    const index = part.indexOf('=');
+    if (index < 0 || part.slice(0, index).trim() !== 'qoderuid') continue;
+    try {
+      return decodeURIComponent(part.slice(index + 1).trim());
+    } catch (_) {
+      return part.slice(index + 1).trim();
+    }
+  }
+  return '';
+}
+
+// The two sites are separate services with their own quota pools, so the same
+// id on each names a different account.
+function qoderAccountIdentity(body, sharedBody, cookie, site) {
+  const cookieKey = hashKey('qoder', cookie);
+  const userId = qoderPayloadUserId(body) || qoderPayloadUserId(sharedBody) || qoderCookieUserId(cookie);
+  if (!userId) return { accountKey: cookieKey, accountKeyAliases: [] };
+  const accountKey = hashKey('qoder', site, `user:${userId}`);
+  return { accountKey, accountKeyAliases: accountKey === cookieKey ? [] : [cookieKey] };
+}
+
 function qoderUserPlanUrl(site = 'global') {
   return `${qoderOrigin(site)}/api/v1/me/userplan`;
 }
@@ -110,6 +144,13 @@ function parseQoderPlanLabel(body) {
   return firstPlanLabel(current);
 }
 
+// The plan's next refresh is the shared add-on cycle; the personal quota payload
+// may only carry a reset for an allowance this account no longer has.
+function parseQoderPlanResetAt(body) {
+  const payload = body?.data && typeof body.data === 'object' ? body.data : body;
+  return toIso(read(payload, 'nextRefreshDate', 'next_refresh_date'));
+}
+
 function quotaSummary(container) {
   return read(container, 'quotaSummary', 'quota_summary') || null;
 }
@@ -132,35 +173,57 @@ function parseSummary(summary) {
   };
 }
 
-function parseQoderUsage(body) {
-  const payload = body?.data && typeof body.data === 'object' ? body.data : body;
-  const total = parseSummary(quotaSummary(read(payload, 'totalQuota', 'total_quota')));
-  if (!total) throw new Error('missing totalQuota.quotaSummary');
-  const shared = parseSummary(quotaSummary(read(payload, 'sharedQuota', 'shared_quota')));
-  const usedCredits = total.used + (shared?.used || 0);
-  const totalCredits = total.total + (shared?.total || 0);
-  const remainingCredits = total.remaining + (shared?.remaining || 0);
-  const usagePercentage = totalCredits > 0 ? (usedCredits / totalCredits) * 100 : total.usagePercentage;
-  const resetsAt = toIso(read(payload, 'nextResetAt', 'next_reset_at'));
-  const window = {
+function resetAtOf(payload) {
+  const raw = read(payload, 'nextResetAt', 'next_reset_at');
+  if (typeof raw === 'number' && raw <= 0) return null;
+  return toIso(raw);
+}
+
+function creditWindow(label, summary, resetsAt) {
+  const usagePercentage = summary.total > 0
+    ? (summary.used / summary.total) * 100
+    : summary.usagePercentage;
+  return {
     kind: 'billing',
-    label: 'Credits',
-    used: usedCredits,
-    limit: totalCredits,
-    remaining: remainingCredits,
+    label,
+    used: summary.used,
+    limit: summary.total,
+    remaining: summary.remaining,
     usedPercent: usagePercentage,
     remainingPercent: Math.max(0, Math.min(100, 100 - usagePercentage)),
     resetsAt,
     showMeter: true
   };
+}
+
+function parseQoderUsage(body, sharedBody, options = {}) {
+  const payload = body?.data && typeof body.data === 'object' ? body.data : body;
+  const sharedPayload = sharedBody?.data && typeof sharedBody.data === 'object' ? sharedBody.data : sharedBody;
+  const personal = parseSummary(quotaSummary(read(payload, 'totalQuota', 'total_quota')));
+  if (!personal) throw new Error('missing totalQuota.quotaSummary');
+  const shared = parseSummary(quotaSummary(
+    sharedBody === undefined && options.allowInlineShared !== false
+      ? read(payload, 'sharedQuota', 'shared_quota')
+      : read(sharedPayload, 'sharedQuota', 'shared_quota')
+  ));
+  if (sharedBody !== undefined && !shared) throw new Error('missing sharedQuota.quotaSummary');
+  // Personal and team allowances are independent pools with their own resets,
+  // so they stay separate windows the user can show or hide independently. A
+  // zero-limit allowance is omitted rather than drawn as "100% remaining".
+  const windows = [];
+  if (personal.total > 0) {
+    windows.push(creditWindow('Credits', personal, resetAtOf(payload)));
+  }
+  if (shared?.total > 0) {
+    windows.push(creditWindow(
+      'Team credits',
+      shared,
+      resetAtOf(sharedPayload) || options.planResetsAt || null
+    ));
+  }
   return {
-    usedCredits,
-    totalCredits,
-    remainingCredits,
-    usagePercentage,
-    unit: total.unit || shared?.unit || '',
-    resetsAt,
-    window
+    windows,
+    unit: personal.unit || shared?.unit || ''
   };
 }
 
@@ -214,26 +277,62 @@ async function fetchQoderLimits(options = {}, deps = {}) {
         : response.status === 429 ? 'sourceRateLimited' : 'unavailable';
       throw error;
     }
-    const usage = parseQoderUsage(body);
+    // Organization credits are reported separately from the personal allowance.
+    // Only shared_quota is this member's cap; organization_pool is the whole team.
+    const { response: sharedResponse, body: sharedBody } = await fetchJsonWithDeadline(
+      `${origin}/api/v1/me/organization-shared-usages/big_model_credits`,
+      { headers },
+      deps
+    );
+    // A personal account has no organization to report, and a shared-endpoint
+    // rejection must not discard a personal allowance that just succeeded.
+    // A partial personal result tells the runtime to retain absent team windows.
+    // Without a personal allowance, report unavailable to retain last-good data.
+    const sharedStatus = sharedResponse.status;
+    if (!sharedResponse.ok && sharedStatus !== 403 && sharedStatus !== 404) {
+      const personalPayload = body?.data && typeof body.data === 'object' ? body.data : body;
+      const hasPersonalCredits = (parseSummary(quotaSummary(
+        read(personalPayload, 'totalQuota', 'total_quota')
+      ))?.total || 0) > 0;
+      if (!(sharedStatus === 401 && hasPersonalCredits)) {
+        const error = new Error(`Qoder shared usage returned ${sharedStatus}`);
+        error.status = sharedStatus === 429 ? 'sourceRateLimited' : 'unavailable';
+        throw error;
+      }
+    }
     let accountLabel = '';
+    let planResetsAt = null;
     try {
       const { response: planResponse, body: planBody } = await fetchJsonWithDeadline(
         qoderUserPlanUrl(site),
         { headers },
         deps
       );
-      if (planResponse.ok) accountLabel = parseQoderPlanLabel(planBody);
+      if (planResponse.ok) {
+        accountLabel = parseQoderPlanLabel(planBody);
+        planResetsAt = parseQoderPlanResetAt(planBody);
+      }
     } catch (_) {}
-    return normalizeLimitProvider({
+    const usage = parseQoderUsage(body, sharedResponse.ok ? sharedBody : undefined, {
+      planResetsAt,
+      allowInlineShared: sharedResponse.ok
+    });
+    const identity = qoderAccountIdentity(body, sharedResponse.ok ? sharedBody : undefined, cookie, site);
+    const result = normalizeLimitProvider({
       provider: 'qoder',
-      accountKey: hashKey('qoder', cookie),
+      accountKey: identity.accountKey,
+      ...(identity.accountKeyAliases.length ? { accountKeyAliases: identity.accountKeyAliases } : {}),
       accountLabel,
       source: 'web',
       status: 'ok',
       updatedAt,
-      windows: [usage.window],
+      windows: usage.windows,
       region: site === 'cn' ? 'cn' : 'global'
     });
+    // Internal runtime metadata is consumed before normalization/publication.
+    // Retained windows keep their old timestamp and make the row unavailable.
+    if (sharedStatus === 401) result.invalidateCachedWindowLabels = [];
+    return result;
   } catch (error) {
     return normalizeLimitProvider({
       provider: 'qoder',

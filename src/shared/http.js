@@ -3,15 +3,16 @@
 const crypto = require('node:crypto');
 const zlib = require('node:zlib');
 const { acceptsEncoding } = require('./hubProtocol');
+const { MAX_UPLOAD_BYTES } = require('./uploadDelta');
 
-const MAX_JSON_BODY_BYTES = 1024 * 1024;
+const MAX_JSON_BODY_BYTES = MAX_UPLOAD_BYTES;
 const JSON_COMPRESSION_MIN_BYTES = 1024;
 
 function corsHeaders(extraHeaders = {}) {
   return {
     'access-control-allow-origin': '*',
     'access-control-allow-methods': 'GET,POST,PUT,DELETE,OPTIONS',
-    'access-control-allow-headers': 'authorization,content-type,x-token-monitor-secret,x-token-monitor-response,x-token-monitor-stream',
+    'access-control-allow-headers': 'authorization,content-type,x-token-monitor-secret,x-token-monitor-response,x-token-monitor-stream,x-token-monitor-upload',
     ...extraHeaders
   };
 }

@@ -80,7 +80,7 @@ function functionBodyBeforeMarker(source, name, marker) {
 
 function runMainFunction(source, name, nextName, expression, context = {}) {
   const body = functionBody(source, name, nextName);
-  return vm.runInNewContext(`${body}\n${expression}`, context);
+  return vm.runInNewContext(`${body}\n${expression}`, { require: id => { assert.equal(id, './plugins/limits'); return require('../../src/electron/plugins/limits'); }, ...context });
 }
 
 function runRendererFunctions(source, names, expression, context = {}) {
@@ -211,8 +211,11 @@ test('Cursor settings use the shared multi-account rows and inline add flow', ()
   assert.match(details, /<div id="cursorManualPanel" class="opencode-add-form">/);
   assert.match(details, /<div id="cursorManualDetails" class="opencode-add-details accordion-animated-container hidden">/);
   assert.match(details, /data-i18n="settings\.cursor\.addManual">Add account<\/span>/);
-  assert.match(details, /using the button above, then sign in/);
-  assert.match(details, /cursor\.com\/dashboard/);
+  assert.match(details, /using “Open Cursor dashboard”, then sign in/);
+  assert.match(details, /<code>cursor\.com<\/code>/);
+  assert.doesNotMatch(details, /cursorCookiePageButton/);
+  assert.match(details, /data-i18n="settings\.cursor\.cookiePage"[^>]*>[^<]*grok\.com\/dashboard/);
+  assert.match(details, /data-i18n="settings\.cursor\.cookieMissing"/);
   assert.doesNotMatch(details, /cursor\.com\/dashboard\/settings/);
   assert.doesNotMatch(details, /Tokscale|Add an account manually/);
   assert.doesNotMatch(details, /<details|<summary|cursorDetectButton|cursorManualLabel|accountLabel/);
@@ -231,7 +234,16 @@ test('Cursor settings use the shared multi-account rows and inline add flow', ()
   assert.doesNotMatch(body, /cursor-account-row|radio|selectedAccountId|selectAccount/);
 
   const setup = readRendererFile('app.js');
-  assert.match(setup, /openExternal\('https:\/\/cursor\.com\/dashboard'\)/);
+  const navigationStart = setup.indexOf("  document.getElementById('cursorLoginButton').addEventListener");
+  const navigationEnd = setup.indexOf('  const cursorManualSubmit =', navigationStart);
+  const handlers = new Map();
+  const openedUrls = [];
+  vm.runInNewContext(setup.slice(navigationStart, navigationEnd), {
+    document: { getElementById: (id) => ({ addEventListener: (_event, handler) => handlers.set(id, handler) }) },
+    window: { tokenMonitor: { openExternal: (url) => openedUrls.push(url) } }
+  });
+  handlers.get('cursorLoginButton')();
+  assert.deepEqual(openedUrls, ['https://cursor.com']);
   assert.doesNotMatch(setup, /openExternal\('https:\/\/cursor\.com\/dashboard\/settings'\)/);
   assert.match(setup, /cursorAddAccountButton\?\.addEventListener\('click'/);
   assert.match(setup, /cursorManualDetails\?\.classList\.toggle\('hidden', !next\)/);
@@ -257,11 +269,16 @@ test('Cursor removal is available only for accounts added manually in Token Moni
 
 test('Cursor account discovery runs automatically without a separate refresh action', () => {
   const main = readRendererFile('../main.js');
-  const statusBody = functionBody(main, 'cursorStatusValue', 'rebuildWindow');
+  const statusBody = functionBodyBeforeMarker(main, 'cursorStatusValue', '// Plugin hosts load');
   assert.match(statusBody, /if \(discover && !managementBlocked\) \{/);
   assert.match(statusBody, /await cursorAuth\.runCursorDiscover\(\)/);
   assert.doesNotMatch(statusBody, /runCursorSync/);
   assert.match(statusBody, /managementBlocked/);
+  // Desktop-detected accounts follow the desktop sign-in; manual accounts are never hidden.
+  assert.match(statusBody, /const desktop = cursorAuth\.readCursorDesktopSignIn\(\)/);
+  assert.match(statusBody, /if \(!manual\.has\(account\.id\) && !isCursorDetectedAccountCurrent\(\{/);
+  assert.match(statusBody, /unauthorized: expired/);
+  assert.match(statusBody, /listedAccounts\.filter\(Boolean\)/);
   assert.match(main, /options\?\.discover !== true/);
   assert.doesNotMatch(main, /ipcMain\.handle\('cursor:refresh'/);
 
@@ -741,21 +758,19 @@ test('Codex system account switching is exposed from limits account rows', () =>
   // view's policy, so it reaches the Edge Dock card too.
   assert.doesNotMatch(renderLimits, /rowOptions/);
   assert.match(renderLimits, /nodes\.push\(renderLimitProviderSolo\(id, label, provider, color\)\)/);
-  assert.match(renderLimits, /const holdCodexSwitchPopoverRender = codexAccountControl\.deferRender\(els\.limitsPanel\);/);
-  assert.match(renderLimits, /holdLimitDetailTooltipRender \|\| holdCodexSwitchPopoverRender/);
+  assert.match(renderLimits, /if \(codexAccountControl\.deferRender\(els\.limitsPanel\)\) return;/);
   assert.doesNotMatch(renderLimits, /codexSwitchPopoverRenderPending/);
 });
 
-test('DeepSeek and MiniMax API key panels come from the generic account form', () => {
+test('DeepSeek uses the generic form and MiniMax keys use the shared account shell', () => {
   const html = readRendererFile('index.html');
   const css = readRendererFile('styles.css');
   const { limitAccountFormsForRenderer } = require('../../src/electron/limits/accountSettings');
   const forms = limitAccountFormsForRenderer();
   const expectedFields = {
-    deepseek: [['deepseekApiKey', 'password']],
-    minimax: [['minimaxBillingMode', 'select'], ['minimaxApiRegion', 'select'], ['minimaxApiKey', 'password']]
+    deepseek: [['deepseekApiKey', 'password'], ['deepseekWebToken', 'password']]
   };
-  for (const id of ['deepseek', 'minimax']) {
+  for (const id of ['deepseek']) {
     assert.doesNotMatch(html, new RegExp(`id="${id}(AccountGroup|ManualPanel|ApiKeyInput)"`), id);
     assert.doesNotMatch(css, new RegExp(`#${id}ManualPanel`), id);
     const form = forms.find((candidate) => candidate.id === id);
@@ -778,38 +793,8 @@ test('DeepSeek and MiniMax API key panels come from the generic account form', (
   }
   assert.deepEqual(forms.find(({ id }) => id === 'deepseek').openUrl, { url: 'https://platform.deepseek.com/api_keys' });
 
-  // MiniMax follows the selection, with successful-probe status for Auto;
-  // the form declares that, so the renderer has no MiniMax branch of its own.
   const app = readRendererFile('app.js');
-  assert.deepEqual(forms.find(({ id }) => id === 'minimax').openUrl, {
-    byField: 'minimaxApiRegion',
-    urls: {
-      cn: 'https://platform.minimaxi.com/user-center/payment/token-plan',
-      intl: 'https://platform.minimax.io/user-center/payment/token-plan'
-    },
-    byStatus: 'region',
-    statusUrls: {
-      cn: 'https://platform.minimaxi.com/user-center/payment/token-plan',
-      en: 'https://platform.minimax.io/user-center/payment/token-plan'
-    },
-    default: 'https://platform.minimaxi.com/user-center/payment/token-plan',
-    pathByField: {
-      byField: 'minimaxBillingMode',
-      values: { 'token-plan': '/user-center/payment/token-plan', api: '/user-center/payment/balance' }
-    }
-  });
-
-  // The region is a plain setting beside the credential, so Clear leaves it
-  // alone and it stays reachable once a key is saved — a user whose auto-probe
-  // keeps flapping needs the switch after linking, not before.
-  const minimax = forms.find(({ id }) => id === 'minimax');
-  const region = minimax.fields.find(({ key }) => key === 'minimaxApiRegion');
-  assert.equal(region.saveOnChange, true);
-  assert.deepEqual(region.options.map(({ value }) => value), ['auto', 'cn', 'intl']);
-  for (const { labelKey } of region.options) {
-    assert.match(labelKey, /^settings\.minimax\./, labelKey);
-  }
-  assert.deepEqual(minimax.top, [{ field: 'minimaxBillingMode' }, { field: 'minimaxApiRegion' }]);
+  assert.equal(forms.some(({ id }) => id === 'minimax'), false);
 
   // The region never becomes a credential: no store path, so it stays in
   // settings.json only after a selection; an implicit default stays empty.
@@ -884,7 +869,7 @@ test('API key account entries share styling and Copilot uses the folded token en
     }
   }
 
-  assert.match(css, /\.thirdparty-field :is\(input, select\)\s*\{[\s\S]*?font-size: 0\.75rem;/);
+  assert.match(css, /\.thirdparty-field :is\(input, select, \.select-control-trigger\)\s*\{[\s\S]*?font-size: 0\.75rem;/);
 });
 
 test('Copilot account panel provides GitHub sign-in plus manual token fallback', () => {
@@ -892,7 +877,7 @@ test('Copilot account panel provides GitHub sign-in plus manual token fallback',
   const details = html.match(/<div id="copilotSettingsDetails"[\s\S]*?<div id="copilotErrorMessage" class="settings-note error hidden" role="alert"><\/div>/)?.[0] || '';
   assert.match(details, /<button id="copilotSignInButton"[\s\S]*data-i18n="settings\.copilot\.signIn">/);
   assert.match(details, /<button id="copilotCancelSignInButton" class="hidden" data-i18n="settings\.common\.cancel">/);
-  assert.match(details, /<button id="copilotLogoutButton" class="hidden" data-i18n="settings\.copilot\.logout">/);
+  assert.match(details, /<div id="copilotAccountList" class="managed-account-list">/);
   assert.match(details, /<pre id="copilotLoginStatus" class="codex-login-output hidden" role="status" aria-live="polite"><\/pre>/);
   assert.match(details, /<button id="copilotManualToggle"[\s\S]*aria-controls="copilotManualDetails"/);
   assert.match(details, /<div id="copilotManualDetails" class="opencode-add-details accordion-animated-container hidden">/);
@@ -913,11 +898,11 @@ test('Copilot account panel provides GitHub sign-in plus manual token fallback',
   assert.match(setupBody, /state\.copilotAuthorizeMessage = t\('settings\.copilot\.authorize'/);
   assert.match(setupBody, /\[state\.copilotAuthorizeMessage, t\('settings\.copilot\.polling'\)\]\.filter\(Boolean\)\.join\('\\n\\n'\)/);
   assert.match(setupBody, /setCopilotManualExpanded\(false\)/);
-  assert.match(setupBody, /saveSettings\(\{ copilotApiToken: input\.value \}\)/);
-  assert.match(setupBody, /saveSettings\(\{ copilotApiToken: '' \}\)/);
+  assert.match(setupBody, /window\.tokenMonitor\.copilot\.addAccount\(input\.value\)/);
+  assert.doesNotMatch(setupBody, /saveSettings\(\{ copilotApiToken:/);
 
   const renderBody = functionBody(app, 'renderCopilotStatus', 'renderOpenCodeProfiles');
-  assert.match(renderBody, /cancelBtn\.classList\.toggle\('hidden', !state\.copilotSignInBusy \|\| !state\.copilotSignInCancelable \|\| linked\)/);
+  assert.match(renderBody, /cancelBtn\.classList\.toggle\('hidden', !state\.copilotSignInBusy \|\| !state\.copilotSignInCancelable\)/);
   assert.match(renderBody, /refreshBtn\.classList\.toggle\('hidden', !configured \|\| \(state\.copilotSignInBusy && !linked\)\)/);
   assert.match(renderBody, /accountShellApi\.render\(\{[\s\S]*?error: errorEl,\s*errorText: state\.copilotErrorMessage/);
   assert.doesNotMatch(renderBody, /errorEl\.textContent = '';/);
@@ -977,16 +962,19 @@ test('Z.ai, Qoder, Trae and Ollama panels are generated from their declared form
   assert.deepEqual(forms.qoder.openUrl.urls, { global: 'https://qoder.com/account/usage', cn: 'https://qoder.com.cn/account/usage' });
   assert.doesNotMatch(JSON.stringify(forms.qoder), /settings\.qoder\.note/);
 
-  // Trae: the optional device ID comes after the token, then its note.
-  assert.deepEqual(forms.trae.manual.slice(1), [
-    { field: 'traeAccessToken' }, { field: 'traeDeviceId' }, { note: 'settings.trae.deviceIdNote' }
+  // Trae defaults to the browser Cookie lane; legacy token/device inputs stay available.
+  assert.deepEqual(forms.trae.credentialChoice.fields, ['traeCookie', 'traeAccessToken']);
+  assert.equal(forms.trae.fields[0].input, 'textarea');
+  assert.equal(forms.trae.fields[1].placeholder, 'Cloud-IDE-Token');
+  assert.equal(forms.trae.fields[2].required, false);
+  assert.deepEqual(forms.trae.manual[0].steps, ['settings.trae.step1', 'settings.trae.cookieStep2', 'settings.trae.cookieStep3', 'settings.trae.step4']);
+  assert.deepEqual(forms.trae.manual.slice(-3), [
+    { field: 'traeAccessToken', whenCredential: 'traeAccessToken' },
+    { field: 'traeDeviceId', whenCredential: 'traeAccessToken' },
+    { note: 'settings.trae.deviceIdNote', whenCredential: 'traeAccessToken' }
   ]);
-  assert.equal(forms.trae.fields[0].placeholder, 'Cloud-IDE-Token');
-  assert.equal(forms.trae.fields[1].required, false);
-  assert.deepEqual(forms.trae.manual[0].steps[2], ['settings.trae.step3Before', { code: 'Cloud-IDE-Token' }, 'settings.trae.step3After']);
   assert.equal(forms.trae.messages.required, 'settings.trae.missingAuthorization');
-  assert.doesNotMatch(JSON.stringify(forms.trae), /settings\.trae\.note/);
-  assert.match(readRendererFile('i18n.js'), /'settings\.trae\.deviceIdNote': '[^']*ide_user_ent_usage[^']*X-Device-Id/);
+
 
   // Ollama chooses one draft lane; API key is the fresh-install default.
   assert.deepEqual(forms.ollama.credentialChoice.fields, ['ollamaApiKey', 'ollamaCookie']);
@@ -1235,14 +1223,12 @@ test('Claude Web account panel stores a redacted cookie and opens only the usage
   assert.equal(limitProviderUrlAllowed('claude.ai', '/'), false);
 });
 
-test('DeepSeek and MiniMax key changes invalidate stale provider status before re-checking', () => {
+test('DeepSeek key changes invalidate stale provider status before re-checking', () => {
   const app = readRendererFile('app.js');
-  // Their pills and groups are generated from the form id, so the hand-kept id
-  // maps no longer name them.
+  // Its pills and groups are generated from the form id, so the hand-kept id
+  // map no longer names it.
   assert.doesNotMatch(app, /deepseek: 'deepseek(AccountGroup|ApiKeyStatus)'/);
-  assert.doesNotMatch(app, /minimax: 'minimax(AccountGroup|ApiKeyStatus)'/);
   assert.match(app, /deepseekPendingCheckSince: 0/);
-  assert.match(app, /minimaxPendingCheckSince: 0/);
 
   const saveBody = functionBody(app, 'saveAccountCredential', 'submitAccountCredential');
   assert.match(saveBody, /saveCredential\(id, values\)[\s\S]*markExternalProviderCheckPending\(id, result\.checkedSince\);[\s\S]*renderExternalProviderStatus\(id\);[\s\S]*await refreshStats\(\);/);
@@ -1593,7 +1579,8 @@ test('Cline names the credential lane that went bad, not always the key field', 
     'zh-CN': '打开 Cline',
     ko: 'Cline 열기',
     ja: 'Cline を開く',
-    'pt-BR': 'Abrir o Cline'
+    'pt-BR': 'Abrir o Cline',
+    es: 'Abrir Cline'
   });
   assert.deepEqual(Object.fromEntries(Object.entries(MESSAGES).map(([locale, messages]) => [
     locale,
@@ -1604,7 +1591,8 @@ test('Cline names the credential lane that went bad, not always the key field', 
     'zh-CN': '已连接',
     ko: '연결됨',
     ja: '接続済み',
-    'pt-BR': 'Conectado'
+    'pt-BR': 'Conectado',
+    es: 'Conectada'
   });
 });
 
@@ -1968,11 +1956,12 @@ test('collection cadence setting is exposed in the Collection panel', () => {
   assert.match(controls, /data-i18n="settings\.collection\.cadence"/);
   assert.match(controls, /value="live"/);
   assert.match(controls, /value="smart"[\s\S]*data-i18n="settings\.collection\.mode\.smart"/);
-  assert.match(i18n, /'settings\.collection\.modeDesc': 'Smart mode collects after agent activity, with an hourly reconciliation; fixed intervals turn off file watching\.'/);
+  assert.match(i18n, /"settings\.collection\.mode\.smartDesc": "Collect after agent activity, with hourly reconciliation\."/);
   assert.match(controls, /<option value="300000"/);
   assert.match(controls, /<option value="900000"/);
   assert.match(controls, /<option value="1800000"/);
-  assert.match(controls, /id="collectionCadenceNote"[\s\S]*hidden/);
+  for (const mode of ['live', 'smart', 'interval']) assert.ok(controls.includes(`data-select-description="settings.collection.mode.${mode}Desc"`));
+  assert.doesNotMatch(controls, /id="collectionCadenceNote"/);
   assert.doesNotMatch(controls, /<option value="3600000"/);
   assert.doesNotMatch(controls, /id="collectionModeInput"/);
   assert.doesNotMatch(controls, /id="collectionIntervalInput"/);
@@ -1980,7 +1969,7 @@ test('collection cadence setting is exposed in the Collection panel', () => {
   const app = readRendererFile('app.js');
   const syncBody = functionBody(app, 'syncSettingsForm', 'enabledClientSet');
   assert.match(syncBody, /collectionCadenceInput/);
-  assert.match(syncBody, /collectionCadenceNote[\s\S]*\.hidden\s*=/);
+  assert.doesNotMatch(syncBody, /collectionCadenceNote/);
 
   const listenerSlice = app.slice(
     app.indexOf("els.collectionCadenceInput?.addEventListener('change'"),
@@ -2352,8 +2341,6 @@ test('Host Hub invalid ports preserve the persisted port when another field save
   await els.saveSettingsButton.dispatch('click');
 
   assert.deepEqual(patches, [{
-    hubUrl: '',
-    secret: '',
     deviceId: 'draft-device',
     hubHostPort: 18000
   }]);
@@ -2597,8 +2584,6 @@ test('Host Hub port draft survives settings rehydration and saves with Hub field
 
   await els.saveSettingsButton.dispatch('click');
   assert.deepEqual(patches, [{
-    hubUrl: '',
-    secret: '',
     deviceId: 'saved-device',
     hubHostPort: 18000
   }]);
@@ -2667,8 +2652,6 @@ test('Host Hub port draft survives leaving and returning to Host mode', async ()
 
   await els.saveSettingsButton.dispatch('click');
   assert.deepEqual(patches, [{
-    hubUrl: '',
-    secret: '',
     deviceId: 'saved-device',
     hubHostPort: 18000
   }]);
@@ -2690,7 +2673,7 @@ test('remote Hub build status is wired as a separate localized sync hint', () =>
   assert.match(app, /getHubBuildStatus/);
   assert.match(app, /function renderHubBuildStatus\(\)/);
   assert.doesNotMatch(app, /await refreshHubBuildStatus\(\)/);
-  assert.equal([...app.matchAll(/void refreshHubBuildStatus\(\)/g)].length, 5);
+  assert.equal([...app.matchAll(/void refreshHubBuildStatus\(\)/g)].length, 6);
   const refreshBody = functionBody(app, 'refreshHubBuildStatus', 'syncPeriodTabs');
   assert.match(refreshBody, /const request = \+\+hubBuildStatusRequest/);
   assert.equal([...refreshBody.matchAll(/request !== hubBuildStatusRequest/g)].length, 2);
@@ -2821,7 +2804,7 @@ test('WorkBuddy Electron fetch adapter forwards parsed response JSON', () => {
 test('main settings migrateLimitProviders normalizes without expanding old defaults', () => {
   const main = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'electron', 'main.js'), 'utf8');
   const body = functionBody(main, 'migrateLimitProviders', 'migrateLimitProviderOrder');
-  assert.match(body, /return parseLimitProviders\(value\)\.join/);
+  assert.match(body, /desktopProviderPreference\(value, parseLimitProviders\)/);
   assert.doesNotMatch(body, /preMimoDefault|legacyDefault.*return defaultLimitProviders/);
 });
 
@@ -2839,7 +2822,7 @@ test('Home limits groups multiple MiMo accounts like Codex', () => {
     frameBody,
     /const groupProvider = \{\s*provider: providerId,\s*status: 'ok',\s*windows: \[\],\s*accountGroup: true,\s*groupAccounts: providers\s*\};/
   );
-  assert.match(frameBody, /planText: count \? limitGroupCountText\(providerId, count\) : ''/);
+  assert.match(frameBody, /count \? limitGroupCountText\(providerId, count\) : ''/);
   assert.match(groupBody, /renderLimitProviderGroupFrame\(\s*providerId, label, providers, color, \{ count: providers\.length, markId \}/);
   assert.match(viewBody('limitGroupCountText', 'renderLimitProviderGroup'), /settings\.\$\{providerId\}\.nAccounts/);
 

@@ -11,10 +11,13 @@ npm run agent      # start the headless collector→hub agent
 npm run agent:once # one-shot collect+post, then exit (useful for cron/launchd)
 npm test           # run the node:test suite (node --test "tests/**/*.test.js")
 npm run lint       # ESLint flat config (eslint.config.js)
-npm run verify     # lint + test (single local entry point)
+npm run typecheck  # opt-in JavaScript type checking (no emit)
+npm run verify     # lint + typecheck + test (single local entry point)
 ```
 
-Automated verification is `npm run verify`; CI (`.github/workflows/ci.yml`) runs lint + test on push/PR across Node 22 & 24. The toolchain (ESLint 10 + the node:test glob) needs Node 22.13+ and DSH session decoding needs `zlib.zstdDecompressSync` (Node 22.15+), which is why `engines.node` is `>=22.15.0`.
+Automated verification is `npm run verify`; CI (`.github/workflows/ci.yml`) runs lint + typecheck + test on push/PR across Node 22 & 24. The toolchain (ESLint 10 + the node:test glob) needs Node 22.13+ and DSH session decoding needs `zlib.zstdDecompressSync` (Node 22.15+), which is why `engines.node` is `>=22.15.0`.
+
+New shared modules start with `// @ts-check`; existing files opt in when touched for a reason. Type checking uses JSDoc and emits no code.
 
 To dry-run the agent without posting: `npm run agent:once -- --dry-run`.
 
@@ -46,7 +49,7 @@ Each line is a constraint that a change elsewhere has broken before, or would br
 - **Limits refresh triggers.** Local token usage never triggers a limits refresh, and `burn-rate` stays out of `COOLDOWN_BYPASS_REASONS`. → `docs/architecture.md` (Limits collector)
 - **Electron transport.** Provider calls take the injected transport. Under Chromium never set a `Host` header, keep `credentials: 'omit'`, and expect a cross-origin `Referer` with a path to be cancelled. → `docs/architecture.md` (Outbound transport)
 - **Credentials stay in main.** Renderer settings are default-deny; a raw credential crosses only through an explicit allowlist. New fixed credentials declare a `storePath` in the provider's `account.js` (`CREDENTIAL_SETTING_PATHS` derives from it) — never a literal entry in `credentialStore.js`, never a provider-specific store. Limits account leaves must stay require-free; renderer form DTOs expose display/action metadata, never store paths, resolvers or secrets. → `docs/architecture.md` (Settings and credentials)
-- **Public stats stay public.** The subscription version stamp is added by `statsWithSubscriptionVersion()` on authenticated paths only; folding it into `getStats()` leaks through the unauthenticated route. → `docs/architecture.md` (Subscriptions)
+- **Public stats stay public.** In the Worker, the subscription version stamp and sync-settings revisions are added by `statsWithSubscriptionVersion()` on authenticated paths only; folding them into `getStats()` leaks through the unauthenticated public route. The Node hub has no public route, so its `getStats()` sets both directly. → `docs/architecture.md` (Subscriptions)
 - **Balance quotas.** Key money display off `windows[].metric === 'credits'` through `limits/balanceDisplay.js`, never a provider whitelist; display-only percentages stay out of the wire shape. → `docs/architecture.md` (Balance quotas)
 - **Compatibility surfaces.** Settings keys, env vars, CLI flags, Hub endpoints and the wire shape have external users. Treat changes as breaking and plan the migration.
 
@@ -57,7 +60,7 @@ Each line is a constraint that a change elsewhere has broken before, or would br
 - **Validate at boundaries; trust established internal contracts.** Validate and normalize external or persisted data at the boundary that owns it. Internal functions should rely on those established guarantees rather than repeat the same checks or silently replace invalid internal values with empty defaults. Add further checks when a function crosses another trust boundary or needs an invariant not already guaranteed. Preserve validation required for supported compatibility.
 - **Make abstractions earn their place.** Prefer straightforward code over helpers, wrappers, or configuration added for possible future reuse. Extract an abstraction when it removes meaningful duplication, clarifies a complex operation, or establishes a useful responsibility boundary. A single-use helper is fine when its name and structure make the caller easier to understand; reuse count alone is not the deciding factor.
 - **Don't add dependencies or new tooling without discussing it first** (in the issue or PR description).
-- **Keep documentation close to its scope and current.** This file holds cross-cutting commands, tripwires and conventions; `docs/architecture.md` holds cross-subsystem owners, invariants and their reasons. Subsystem-specific guidance belongs with that subsystem, and provider knowledge in `docs/providers/`. Keep implementation mechanics beside the code and change summaries in the PR. Document non-obvious constraints and gotchas, not descriptions the code already makes obvious. Avoid hardcoded counts and exhaustive lists (prefer a command like `ls src/shared/` over a hand-maintained one); verify claims against the code before writing them; delete anything that has gone stale — an outdated note is worse than none.
+- **Keep documentation close to its scope and current.** This file holds cross-cutting commands, tripwires and conventions; `docs/architecture.md` holds cross-subsystem owners, invariants and their reasons. Subsystem-specific guidance belongs with that subsystem, and provider knowledge in `docs/providers/`. Keep implementation mechanics beside the code and change summaries in the PR. Author-facing documentation should focus on supported APIs, observable behavior, limitations, and practical examples. Do not present private implementation details or bug-fix history as public contracts. Document non-obvious constraints and gotchas, not descriptions the code already makes obvious. Avoid hardcoded counts and exhaustive lists (prefer a command like `ls src/shared/` over a hand-maintained one); verify claims against the code before writing them; delete anything that has gone stale — an outdated note is worse than none.
 
 ### Commit messages
 

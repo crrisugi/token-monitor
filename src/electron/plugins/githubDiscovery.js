@@ -67,18 +67,28 @@ function createGitHubDiscovery({ root, fetchImpl, now = Date.now, enabled = fals
       if (!entries.some(entry => entry.id === id)) throw new Error('Unknown GitHub discovery entry');
       return this.repositoryReadme(`https://github.com/${id}`, signal);
     },
-    async repositoryReadme(repository, signal) {
+    async repositoryReadme(repository, signal, filePath = '') {
       const id = new URL(repository).pathname.replace(/^\/|\/$/g, '');
       if (!REPO_RE.test(id)) throw new Error('Invalid repository');
-      const raw = JSON.parse((await request(`https://api.github.com/repos/${id}/readme`, 512 * 1024, signal)).toString('utf8'));
+      const endpoint = filePath ? `contents/${filePath.split('/').map(encodeURIComponent).join('/')}` : 'readme';
+      const raw = JSON.parse((await request(`https://api.github.com/repos/${id}/${endpoint}`, 512 * 1024, signal)).toString('utf8'));
+      if (filePath && (raw.type !== 'file' || raw.path !== filePath)) throw new Error('Invalid README file');
       if (raw.encoding !== 'base64' || typeof raw.content !== 'string') throw new Error('README is unavailable');
       const bytes = Buffer.from(raw.content, 'base64');
       if (bytes.length > 256 * 1024) throw new Error('README is too large');
       const base = new URL(raw.download_url);
-      if (base.protocol !== 'https:' || base.hostname !== 'raw.githubusercontent.com' || !base.pathname.toLowerCase().startsWith(`/${id.toLowerCase()}/`) || base.username || base.password) throw new Error('Invalid README location');
+      if (base.protocol !== 'https:' || base.hostname !== 'raw.githubusercontent.com' || base.port || base.search || base.hash || !base.pathname.toLowerCase().startsWith(`/${id.toLowerCase()}/`) || base.username || base.password) throw new Error('Invalid README location');
       const page = new URL(raw.html_url);
       if (page.protocol !== 'https:' || page.hostname !== 'github.com' || page.port || page.username || page.password || page.search || page.hash || !page.pathname.toLowerCase().startsWith(`/${id.toLowerCase()}/blob/`)) throw new Error('Invalid README page');
-      return { readme: new TextDecoder('utf-8', { fatal: true }).decode(bytes).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, ''), baseUrl: page.href, imageBaseUrl: base.href };
+      // The page path is /<owner>/<repo>/blob/<ref>/<file>. Strip the file
+      // segments to get the ref-scoped root that root-relative README links
+      // resolve against. GitHub's API always reports the file path.
+      const fileSegments = typeof raw.path === 'string' && raw.path ? raw.path.split('/').length : 0;
+      const pageSegments = page.pathname.split('/');
+      const repositoryBaseUrl = fileSegments && pageSegments.length > fileSegments
+        ? `${page.origin}${pageSegments.slice(0, pageSegments.length - fileSegments).join('/')}/`
+        : '';
+      return { readme: new TextDecoder('utf-8', { fatal: true }).decode(bytes).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, ''), baseUrl: page.href, imageBaseUrl: base.href, repositoryBaseUrl };
     },
     dispose() { disposed = true; for (const controller of controllers) controller.abort(); controllers.clear(); }
   };

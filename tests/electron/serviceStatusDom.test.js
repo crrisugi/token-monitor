@@ -130,7 +130,8 @@ test('view drag query does not select the nested status-provider rows', () => {
 test('the Status panel passes the visible provider ids to the fetch and orders by prefs', () => {
   const app = readRendererFile('app.js');
   const refreshBody = functionBody(app, 'refreshServiceStatus', 'formatAgo');
-  assert.match(refreshBody, /providerIds:/);
+  assert.match(refreshBody, /const providerIds = visibleServiceProviderIds\(\)/);
+  assert.match(refreshBody, /getServiceStatus\(\{[^\n]*providerIds\s*\}/);
   assert.match(app, /function visibleServiceProviderIds/);
   assert.match(app, /serviceStatus\.allHidden/);
 });
@@ -236,7 +237,7 @@ test('Home limit provider settings stay compact and list only enabled providers'
   assert.match(homeLimitRows, /showHomeLimitProviderNames === true \|\| state\.settings\?\.showToolIcons === false/);
   assert.match(homeLimitRows, /`\$\{providerTitle\} · \$\{accountTitle\}`/);
   assert.match(renderHomeLimitProviderList, /enabledLimitProviderSet\(\)/);
-  assert.match(renderHomeLimitProviderList, /orderedLimitProviders\(LIMIT_PROVIDERS, homeLimitProviderOrderValue\(\)\)/);
+  assert.match(renderHomeLimitProviderList, /orderedLimitProviders\(desktopLimitProviders\(\), homeLimitProviderOrderValue\(\)\)/);
   assert.match(renderHomeLimitProviderList, /const hasCustomOrder = Boolean\(state\.settings\?\.homeLimitProviderOrder\);/);
   assert.match(renderHomeLimitProviderList, /\.filter\(\(\{ id \}\) => enabled\.has\(id\)\)/);
   assert.match(resetHomeLimitProviderOrder, /saveSettings\(\{ homeLimitProviderOrder: '' \}\)/);
@@ -301,7 +302,7 @@ test('view switcher preserves click-to-cycle and direct selection without crowdi
   assert.match(cssRule(css, '.view-switcher-menu'), /transition:[\s\S]*opacity 190ms/);
   assert.match(cssRule(css, '.view-switcher-menu'), /visibility 0s linear 0s/);
   assert.doesNotMatch(cssRule(css, '.view-switcher-menu'), /width:\s*154px/);
-  const menuSurface = cssRule(css, '.view-switcher-menu,\n.select-control-popup,\n.sync-content-dialog,\n.settings-help-popover,\n.app-update-popover');
+  const menuSurface = cssRule(css, '.view-switcher-menu,\n.select-control-popup,\n.sync-content-dialog,\n.plugin-catalog-dialog,\n.settings-help-popover,\n.app-update-popover');
   assert.match(menuSurface, /background:[\s\S]*var\(--glass-rgb\)/);
   assert.doesNotMatch(menuSurface, /var\(--panel-rgb\)/);
   assert.doesNotMatch(cssRule(css, '.view-switcher-menu.hidden'), /display:\s*none/);

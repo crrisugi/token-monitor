@@ -8,7 +8,7 @@
   if (root) root.TokenMonitorPluginUi = api;
 })(typeof window !== 'undefined' ? window : null, function createApi() {
   function createHost({ document, window, bridge, services = {}, importModule = url => import(url), onError = () => {}, onLoaded = () => {} }) {
-    const owners = new WeakMap();
+    const owners = new WeakMap(), drains = new WeakMap(), requests = new WeakMap();
     const modules = new Map(), mounts = new Map(), blocked = new Set(), jobs = new Map(), failures = new Map();
     let disposed = false;
     function report(error, record) {
@@ -38,7 +38,7 @@
     }
     function load(descriptor) {
       if (disposed || blocked.has(descriptor.pluginId)) return Promise.reject(new Error('Plugin UI is disabled'));
-      const key = `${descriptor.pluginId}:${descriptor.revision}`;
+      const key = `${descriptor.pluginId}:${descriptor.revision}:${descriptor.nativeCredentials ? descriptor.ref : 'author'}`;
       if (!modules.has(key)) modules.set(key, (async () => {
         // Register ownership before importing author code, including pending activation.
         bridge.uiLoading?.(descriptor.pluginId);
@@ -82,6 +82,7 @@
           onDispose(fn) { cleanup.push(fn); },
           asset: name => new URL(name, descriptor.entry).href
         };
+        if (services.native?.credentials) ctx.native = { ...services.native, credentials: services.native.credentials(ctx.host.call) };
         const off = bridge.subscribe?.(descriptor.pluginId, value => {
           latestData = value;
           for (const fn of listeners) { try { fn(value); } catch (error) { onError(error, descriptor); } }
@@ -92,7 +93,7 @@
           document.head.append(link); cleanup.push(() => link.remove());
         }
         try {
-          const module = await importModule(descriptor.entry);
+          const module = descriptor.nativeCredentials ? { activate: () => ({ mount: (container, context) => ctx.native.credentials.mount(container, { moduleId: context.moduleId }) }) } : await importModule(descriptor.entry);
           const instance = module.activate ? await module.activate(ctx) : module;
           if (typeof instance?.mount !== 'function' && typeof instance?.renderTray !== 'function') throw new Error('Plugin UI must implement mount or renderTray');
           cleanup.push(() => instance.dispose?.());
@@ -109,32 +110,60 @@
         data: record.descriptor.data, container: record.container, headerActions: record.headerActions };
     }
     function update(record) {
-      if (record.failed || disposed || blocked.has(record.descriptor.pluginId) || mounts.get(record.container) !== record) return;
-      const pending = track(record.descriptor.pluginId, (async () => {
-        try { await record.instance?.update?.(context(record)); }
-        catch (error) { report(error, record); }
-      })());
+      if (record.failed || disposed || blocked.has(record.descriptor.pluginId) || mounts.get(record.container) !== record || !record.instance) return;
+      record.needsUpdate = true;
+      if (record.updating) return record.updating;
+      let settle;
+      const pending = track(record.descriptor.pluginId, new Promise(resolve => { settle = resolve; }));
+      // Register before entering author code, including a synchronous reentrant
+      // update. While busy, retain only the latest context rather than invoking
+      // overlapping callbacks which can paint stale data after a newer result.
+      record.updating = pending;
       (record.updates ||= new Set()).add(pending);
-      void pending.finally(() => record.updates.delete(pending));
+      void (async () => {
+        try {
+          while (record.needsUpdate && !record.failed && !disposed
+            && !blocked.has(record.descriptor.pluginId) && mounts.get(record.container) === record) {
+            record.needsUpdate = false;
+            try { await record.instance.update?.(context(record)); }
+            catch (error) { report(error, record); }
+          }
+        } finally {
+          record.updating = null; record.updates.delete(pending); settle();
+        }
+      })();
+      return pending;
+    }
+    function retire(container) {
+      const record = mounts.get(container);
+      if (!record) return drains.get(container);
+      mounts.delete(container); record.observer?.disconnect();
+      const prior = drains.get(container);
+      const pending = cleanup(record.descriptor.pluginId, async () => {
+        try {
+          if (prior) await prior;
+          // A superseded initial mount may still write before returning its
+          // instance. It must settle before disposal and container handover.
+          await record.initializing;
+          if (record.updates?.size) await Promise.all([...record.updates]);
+          await record.instance?.dispose?.();
+        } finally {
+          if (owners.get(container) === record) container.replaceChildren();
+          record.headerActions?.remove();
+        }
+      });
+      // Register before notifying author callbacks, which may request another
+      // mount synchronously. Replacement is serialized per container only.
+      drains.set(container, pending);
+      void pending.then(() => { if (drains.get(container) === pending) drains.delete(container); });
+      record.headerActions?.remove();
+      container.replaceChildren();
+      record.context.onMountStatus?.(false);
       return pending;
     }
     function unmount(container) {
-      const record = mounts.get(container);
-      if (!record) return;
-      mounts.delete(container); record.observer?.disconnect();
-      record.headerActions?.remove();
-      record.context.onMountStatus?.(false);
-      if (record.instance) cleanup(record.descriptor.pluginId, async () => {
-        try {
-          if (record.updates?.size) await Promise.all([...record.updates]);
-          await record.instance.dispose?.();
-        } finally {
-          // A settled redraw may have repopulated this now-unmounted container.
-          // Never clear a newer mount that has since taken ownership.
-          if (owners.get(container) === record) container.replaceChildren();
-        }
-      });
-      container.replaceChildren();
+      requests.delete(container);
+      return retire(container);
     }
     function syncHeaderActions(record, parent) {
       if (!parent) { record.headerActions?.remove(); record.headerActions = undefined; return; }
@@ -155,20 +184,28 @@
         if (mounts.get(container) === previous && previous.instance && !previous.failed) previous.context.onMountStatus?.(true);
         return;
       }
-      unmount(container);
+      const request = {};
+      requests.set(container, request);
+      const prior = retire(container);
+      if (requests.get(container) !== request) return;
       const record = { container, descriptor, context: value };
-      syncHeaderActions(record, value.headerActions);
-      mounts.set(container, record); owners.set(container, record);
+      let initialized;
+      record.initializing = new Promise(resolve => { initialized = resolve; });
+      mounts.set(container, record);
       try {
+        if (prior) await prior;
+        if (disposed || blocked.has(descriptor.pluginId) || mounts.get(container) !== record) return;
+        owners.set(container, record);
+        syncHeaderActions(record, record.context.headerActions);
         const loaded = await load(descriptor);
         if (disposed || blocked.has(descriptor.pluginId) || mounts.get(container) !== record) return;
         if (typeof loaded.instance.mount !== 'function') throw new Error('This plugin has no content mount');
         const initialContext = record.context;
         record.instance = (await loaded.instance.mount(container, context(record))) || {};
-        if (disposed || mounts.get(container) !== record) { await cleanup(descriptor.pluginId, () => record.instance?.dispose?.()); return; }
+        if (disposed || mounts.get(container) !== record) return;
         if (blocked.has(descriptor.pluginId)) return;
-        if (record.context !== initialContext) await record.instance.update?.(context(record));
-        record.context.onMountStatus?.(true);
+        if (record.context !== initialContext) await update(record);
+        if (disposed || blocked.has(descriptor.pluginId) || mounts.get(container) !== record || record.failed) return;
         if (window.ResizeObserver) {
           record.observer = new window.ResizeObserver(entries => {
             const bounds = entries[0]?.contentRect;
@@ -178,25 +215,32 @@
           });
           record.observer.observe(container);
         }
+        record.context.onMountStatus?.(true);
       } catch (error) { report(error, record); }
       finally {
-        // A pending mount can append after unmount, even before rejecting.
-        // Its cleanup must not clear a newer mount in the same container.
-        if (mounts.get(container) !== record && owners.get(container) === record) container.replaceChildren();
+        initialized();
       }
     }
     function mount(container, descriptor, value) {
       return track(descriptor.pluginId, mountRecord(container, descriptor, value));
     }
-    function hasUnsavedChanges(ids) {
-      return [...mounts.values()].some(record => (!ids || ids.includes(record.descriptor.pluginId)) && record.instance?.hasUnsavedChanges?.() === true);
+    function hasUnsavedChanges(ids, content) {
+      return [...mounts.values()].some(record => (!ids || ids.includes(record.descriptor.pluginId))
+        && (!content || content.some(item => item.ref === record.descriptor.ref && item.target === record.context.target))
+        && record.instance?.hasUnsavedChanges?.() === true);
     }
-    async function release(ids) {
+    async function release(ids, automatic = false) {
       for (const id of ids) blocked.add(id);
       // Let in-flight activation/mount/update settle before disposal, so an
       // asynchronous update cannot recreate resources after its cleanup ran.
       // Main bounds this wait; hung author code requires renderer recovery.
       for (const id of ids) while (jobs.has(id)) await Promise.all([...jobs.get(id)]);
+      const priorErrors = ids.flatMap(id => failures.has(id) ? [`${id}: ${failures.get(id)}`] : []);
+      if (automatic && priorErrors.length) throw new Error(priorErrors.join('; '));
+      // Inspection is an earlier IPC round trip. Input or settings edits can
+      // arrive while other hosts or author jobs settle; do not discard them.
+      if (automatic && (hasUnsavedChanges(ids) || services.updatesBlocked?.(ids) === true)) return { deferred: true };
+      if (automatic) services.setUpdatingPlugins?.(ids, true);
       for (const [container, record] of mounts) if (ids.includes(record.descriptor.pluginId)) unmount(container);
       for (const id of ids) while (jobs.has(id)) await Promise.all([...jobs.get(id)]);
       for (const [key, promise] of modules) {
@@ -212,10 +256,15 @@
       const errors = ids.flatMap(id => failures.has(id) ? [`${id}: ${failures.get(id)}`] : []);
       if (errors.length) throw new Error(errors.join('; '));
     }
-    const offLifecycle = bridge.onLifecycle?.(async ({ action, ids }) => {
-      if (action === 'inspect') return { loaded: [...modules.keys()].some(key => ids.some(id => key.startsWith(id + ':'))), unsaved: hasUnsavedChanges(ids) };
-      if (action === 'release') { await release(ids); return {}; }
-      if (action === 'resume') { for (const id of ids) if (!failures.has(id)) blocked.delete(id); return {}; }
+    const offLifecycle = bridge.onLifecycle?.(async ({ action, ids, content, automatic }) => {
+      if (action === 'inspect-update') return { blocked: services.updatesBlocked?.(ids) === true };
+      if (action === 'inspect') return { loaded: [...modules.keys()].some(key => ids.some(id => key.startsWith(id + ':'))), unsaved: hasUnsavedChanges(ids, content) };
+      if (action === 'release') return await release(ids, automatic) || {};
+      if (action === 'resume') {
+        await services.setUpdatingPlugins?.(ids, false);
+        for (const id of ids) if (!failures.has(id)) blocked.delete(id);
+        return {};
+      }
       throw new Error('Unknown plugin lifecycle operation');
     });
     return { mount, unmount, release,
@@ -228,7 +277,7 @@
       load,
       renderTray(descriptor, canvas, context) {
         if (blocked.has(descriptor.pluginId) || disposed) return false;
-        const key = `${descriptor.pluginId}:${descriptor.revision}`;
+        const key = `${descriptor.pluginId}:${descriptor.revision}:${descriptor.nativeCredentials ? descriptor.ref : 'author'}`;
         const loaded = modules.get(key)?.loaded;
         if (!loaded) { void load(descriptor).catch(onError); return false; }
         if (loaded.trayFailed || typeof loaded.instance.renderTray !== 'function') return false;

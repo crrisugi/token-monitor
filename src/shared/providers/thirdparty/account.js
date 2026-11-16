@@ -1,9 +1,11 @@
+// @ts-check
 'use strict';
 
 // Third-party APIs limits account wiring. Leaf module: no requires.
-module.exports = {
+module.exports = /** @satisfies {import('../../limits/accounts').AccountDeclaration} */ ({
   id: 'thirdparty',
   fetch: 'fetchThirdPartyLimits',
+  accountRefresh: true,
   fields: [
     {
       key: 'thirdPartyProfiles',
@@ -18,4 +20,4 @@ module.exports = {
     key: 'thirdPartyEnvConfigured',
     fn: (env, limits) => limits.configuredAccounts({}, { env }).length > 0
   }
-};
+});

@@ -6,6 +6,7 @@ const { isDeepStrictEqual } = require('node:util');
 const { PERIODS, normalizePeriod } = require('../usage');
 const { isSessionReasoningEffortClient } = require('../sessionLive');
 const {
+  archivedSessionInput,
   cloneJson,
   hasSummaryPeriod,
   localDay,
@@ -18,7 +19,8 @@ const {
 const { readJson, sharedDataDir, writeJsonAtomic } = require('../config');
 const { filterReasonixSyntheticSessions, isReasonixSyntheticSession } = require('../providers/reasonix/sessionGuard');
 const { isForkEraPromaSession } = require('../providers/proma/sessionGuard');
-const { splitClientIdFor } = require('../clientIdentitySplits');
+const { CLIENT_IDENTITY_GENERATION, isPreSplitEntry, splitClientIdFor } = require('../clientIdentitySplits');
+const { resolveOmpForkParents } = require('../providers/omp/archiveReconciliation');
 const {
   isLegacyCursorEntry,
   legacyCursorLookup,
@@ -73,12 +75,14 @@ function hasSessionUsage(session) {
 
 // A title/catalog miss on an unchanged observation is not a new turn. Keep
 // its saved setting, but never fill an explicit clear or a newer observation.
-function sessionWithRetainedEffort(session, previous) {
-  if (!isSessionReasoningEffortClient(session.client) || Object.hasOwn(session, 'reasoningEffort')
-    || !previous || !Object.hasOwn(previous, 'reasoningEffort')) return session;
+function sessionWithRetainedSettings(session, previous) {
   const timestamp = Date.parse(session.lastUsedAt);
-  if (!Number.isFinite(timestamp) || timestamp !== Date.parse(previous.lastUsedAt)) return session;
-  return { ...session, reasoningEffort: previous.reasoningEffort };
+  if (!previous || !Number.isFinite(timestamp) || timestamp !== Date.parse(previous.lastUsedAt)) return session;
+  const retained = {};
+  for (const field of ['latestModel', ...(isSessionReasoningEffortClient(session.client) ? ['reasoningEffort'] : [])]) {
+    if (!Object.hasOwn(session, field) && Object.hasOwn(previous, field)) retained[field] = previous[field];
+  }
+  return Object.keys(retained).length ? { ...session, ...retained } : session;
 }
 
 function normalizeSessionUsageArchive(value) {
@@ -98,6 +102,9 @@ function normalizeSessionUsageArchive(value) {
       capturedAt: toDate(rawEntry.capturedAt).toISOString(),
       day: String(rawEntry.day || localDay(rawEntry.capturedAt)),
       month: String(rawEntry.month || localMonth(rawEntry.capturedAt)),
+      ...(rawEntry.clientIdentityGeneration !== undefined
+        ? { clientIdentityGeneration: numberValue(rawEntry.clientIdentityGeneration) }
+        : {}),
       periodWindows: {},
       periods: {}
     };
@@ -124,6 +131,11 @@ function normalizeSessionUsageArchive(value) {
     if (!entry.client || !entry.sessionId || Object.keys(entry.periods).length === 0) continue;
     const supersededBy = sessionKey('cursor', String(rawEntry.supersededBy || '').replace(/^cursor:/, ''));
     if (rawEntry.supersededBy && supersededBy && isLegacyCursorEntry(entry)) entry.supersededBy = supersededBy;
+    if (entry.client === 'pi' && isPreSplitEntry(entry) && typeof rawEntry.supersededBy === 'string'
+      && rawEntry.supersededBy.startsWith('omp:')) {
+      const parent = sessionKey('omp', rawEntry.supersededBy.slice(4));
+      if (parent) entry.supersededBy = parent;
+    }
     const key = `${entry.client}:${entry.sessionId}`;
     const previous = normalized.sessions[key];
     if (!previous) normalized.sessions[key] = entry;
@@ -188,6 +200,26 @@ function pruneExpiredSessionUsagePeriods(archive, capturedAt, changedKeys) {
 // The caller owns the canonical in-memory archive. Updating it in place keeps a
 // watch tick proportional to the sessions in that tick instead of cloning and
 // normalizing every retained session. Persistence receives only changed keys.
+function isFullSessionScan(deviceRecord) {
+  return deviceRecord?.sessionUsageArchiveFullScan === true
+    && PERIODS.every(name => {
+      const value = deviceRecord.periods?.[name] || deviceRecord[name];
+      return value && typeof value === 'object' && value.sessions && typeof value.sessions === 'object';
+    });
+}
+
+function legacyPiForkParents(archive, deviceRecord, options) {
+  if (!isFullSessionScan(deviceRecord)) return new Map();
+  const live = (deviceRecord.periods?.allTime || deviceRecord.allTime).sessions;
+  const scanTime = sessionUsageArchiveDate(deviceRecord, options.now).getTime();
+  const candidates = Object.values(archive.sessions).filter(entry => entry.client === 'pi'
+    && isPreSplitEntry(entry) && !entry.supersededBy
+    && !(Date.parse(entry.periodWindows?.allTime?.capturedAt || entry.capturedAt) > scanTime)
+    && !live[`pi:${entry.sessionId}`] && !live[`omp:${entry.sessionId}`]);
+  if (!candidates.length || !Object.values(live).some(session => session.client === 'omp')) return new Map();
+  return resolveOmpForkParents(candidates.map(entry => entry.sessionId), live, options);
+}
+
 function updateSessionUsageArchive(existingArchive, deviceRecord, capturedAt = new Date(), options = {}) {
   const archive = canonicalSessionUsageArchive(existingArchive);
   const changedKeys = new Set();
@@ -202,11 +234,7 @@ function updateSessionUsageArchive(existingArchive, deviceRecord, capturedAt = n
   const sourceArchivedKeys = new Set(deviceRecord.codexLocalSessionKeys || []);
   // This marks completed App report requests, not parser completeness. A
   // Today-only tick and a progressive preview cannot clear other observations.
-  const fullScan = deviceRecord.sessionUsageArchiveFullScan === true
-    && PERIODS.every(name => {
-      const value = deviceRecord.periods?.[name] || deviceRecord[name];
-      return value && typeof value === 'object' && value.sessions && typeof value.sessions === 'object';
-    });
+  const fullScan = isFullSessionScan(deviceRecord);
   const allTime = options.canonicalSummary === true
     ? (deviceRecord.periods?.allTime || deviceRecord.allTime) : fullScan && periodFor(deviceRecord, 'allTime');
   const liveKeys = fullScan ? new Set(Object.values(allTime.sessions || {})
@@ -237,7 +265,7 @@ function updateSessionUsageArchive(existingArchive, deviceRecord, capturedAt = n
       const archiveKey = sessionKey(observation.client, observation.sessionId);
       if (!archiveKey) continue;
       if (sourceArchivedKeys.has(archiveKey)) continue;
-      const session = sessionWithRetainedEffort(observation, archive.sessions[archiveKey]?.periods?.[periodName]);
+      const session = sessionWithRetainedSettings(observation, archive.sessions[archiveKey]?.periods?.[periodName]);
       // An empty Today scan can leave zero rows in broader anchor deltas.
       // Only a still-identified Today row proves a watch zero was observed.
       if (watchToday && periodName !== 'today' && !hasUsage && !watchToday.sessions?.[archiveKey]) continue;
@@ -247,6 +275,7 @@ function updateSessionUsageArchive(existingArchive, deviceRecord, capturedAt = n
         capturedAt: capturedAtIso,
         day,
         month,
+        clientIdentityGeneration: CLIENT_IDENTITY_GENERATION,
         periodWindows: {},
         periods: {}
       };
@@ -255,6 +284,13 @@ function updateSessionUsageArchive(existingArchive, deviceRecord, capturedAt = n
       // SQLite serializes commits, not collection time. Keep the newest event
       // for each period when two collectors finish in the opposite order.
       if (Number.isFinite(retainedCaptureTime) && retainedCaptureTime > captureTime) continue;
+      // A live all-time observation replaces the old identity's complete usage.
+      // A Today-only observation must not relabel retained broader periods.
+      if (periodName === 'allTime' && entry.client === 'pi' && isPreSplitEntry(entry)) {
+        entry.clientIdentityGeneration = CLIENT_IDENTITY_GENERATION;
+        if (entry.supersededBy?.startsWith('omp:')) delete entry.supersededBy;
+        changedKeys.add(archiveKey);
+      }
       const sameWindow = periodName === 'today'
         ? window.day === day
         : periodName === 'month'
@@ -285,6 +321,11 @@ function updateSessionUsageArchive(existingArchive, deviceRecord, capturedAt = n
   }
 
   if (options.cursorUsageEvents) linkLegacyCursorEvents(archive, changedKeys, options.cursorUsageEvents);
+  for (const [id, parent] of legacyPiForkParents(archive, deviceRecord, { ...options, now: captureDate })) {
+    const key = sessionKey('pi', id);
+    archive.sessions[key].supersededBy = parent;
+    changedKeys.add(key);
+  }
   return { archive, changedKeys };
 }
 
@@ -315,9 +356,9 @@ function linkLegacyCursorEvents(archive, changedKeys, readCursorUsageEvents) {
   }
 }
 
-function captureSessionUsageArchive(existingArchive, deviceRecord, capturedAt = new Date()) {
+function captureSessionUsageArchive(existingArchive, deviceRecord, capturedAt = new Date(), options = {}) {
   const archive = normalizeSessionUsageArchive(existingArchive);
-  return updateSessionUsageArchive(archive, deviceRecord, capturedAt).archive;
+  return updateSessionUsageArchive(archive, deviceRecord, capturedAt, options).archive;
 }
 
 function addSessionBreakdown(period, session) {
@@ -335,22 +376,17 @@ function addSessionBreakdown(period, session) {
     .filter(([, tokens]) => tokens > 0);
   const totalModelTokens = modelTokens.reduce((sum, [, tokens]) => sum + tokens, 0);
   if (totalModelTokens === 0) return;
-  if (modelTokens.length > 1) {
-    for (const [model, tokens] of modelTokens) {
-      period.modelUnclassifiedTokens[model] = (period.modelUnclassifiedTokens[model] || 0) + tokens;
-    }
-    period.capabilities.tokenComponents = false;
-    return;
-  }
-
   for (const [model, tokens] of modelTokens) {
-    const cr = Math.min(tokens, cacheRead);
-    const cw = Math.min(tokens - cr, cacheWrite);
-    const ou = Math.min(tokens - cr - cw, output);
+    const single = modelTokens.length === 1;
+    const observed = single ? null : session.modelTokenComponents?.[model];
+    const cr = observed ? observed.cacheReadTokens : single ? Math.min(tokens, cacheRead) : 0;
+    const cw = observed ? observed.cacheWriteTokens : single ? Math.min(tokens - cr, cacheWrite) : 0;
+    const ou = observed ? observed.outputTokens : single ? Math.min(tokens - cr - cw, output) : 0;
+    const input = observed ? observed.inputTokens : single ? archivedSessionInput(session) : 0;
     if (cr > 0) period.modelCacheReads[model] = (period.modelCacheReads[model] || 0) + cr;
     if (cw > 0) period.modelCacheWrites[model] = (period.modelCacheWrites[model] || 0) + cw;
     if (ou > 0) period.modelOutputs[model] = (period.modelOutputs[model] || 0) + ou;
-    const unclassified = Math.max(0, tokens - cr - cw - ou);
+    const unclassified = Math.max(0, tokens - cr - cw - ou - input);
     if (unclassified > 0) {
       period.modelUnclassifiedTokens[model] = (period.modelUnclassifiedTokens[model] || 0) + unclassified;
       period.capabilities.tokenComponents = false;
@@ -376,7 +412,7 @@ function addArchivedSession(period, session, archiveKey = null) {
   period.cacheReadTokens += cacheRead;
   period.cacheWriteTokens += cacheWrite;
   period.outputTokens += output;
-  const unclassified = Math.max(0, tokens - cacheRead - cacheWrite - output);
+  const unclassified = Math.max(0, tokens - cacheRead - cacheWrite - output - archivedSessionInput(archived));
   if (unclassified > 0) {
     period.unclassifiedTokens += unclassified;
     period.clientUnclassifiedTokens[archived.client] = (period.clientUnclassifiedTokens[archived.client] || 0) + unclassified;
@@ -425,6 +461,7 @@ function applySessionUsageArchive(summary, archive, options = {}) {
   const normalizedArchive = options.canonical === true
     ? canonicalSessionUsageArchive(archive)
     : normalizeSessionUsageArchive(archive);
+  const forkParents = legacyPiForkParents(normalizedArchive, summary, options);
   const now = toDate(options.now);
   const next = options.mutate === true ? summary : cloneJson(summary);
   const periodContainer = next.periods && typeof next.periods === 'object' ? next.periods : next;
@@ -463,7 +500,7 @@ function applySessionUsageArchive(summary, archive, options = {}) {
       const period = targetFor(periodName);
       const key = sessionKey(session.client || entry.client, session.sessionId || entry.sessionId) || archiveKey;
       if (period.sessions[key]) {
-        period.sessions[key] = sessionWithRetainedEffort(period.sessions[key], session);
+        period.sessions[key] = sessionWithRetainedSettings(period.sessions[key], session);
         continue;
       }
       const selectionKey = `${periodName}:${key}`;
@@ -503,16 +540,16 @@ function applySessionUsageArchive(summary, archive, options = {}) {
     // archived copy rather than adding it on top. The check runs late enough to
     // also see the split id's *archived* rows, which the first pass applied.
     if (isLiveUnderSplitId(period, entry, session)) continue;
-    if (entry.supersededBy) {
-      supersededRows.push([period, archiveKey, session, entry.supersededBy]);
+    const supersededBy = entry.supersededBy || forkParents.get(entry.sessionId);
+    if (supersededBy) {
+      supersededRows.push([period, archiveKey, session, supersededBy]);
       continue;
     }
     addArchivedSession(period, session, archiveKey);
   }
 
-  // A legacy Cursor row whose event now belongs to another session is judged
-  // after every other row has replayed, so that session counts whether it is
-  // live or only archived. Without it the row is still the only record.
+  // Legacy Cursor events and inherited Pi fork copies are judged after every
+  // other row has replayed. Without the replacement, retain the only record.
   for (const [period, archiveKey, session, supersededBy] of supersededRows) {
     if (!period.sessions[supersededBy]) addArchivedSession(period, session, archiveKey);
   }

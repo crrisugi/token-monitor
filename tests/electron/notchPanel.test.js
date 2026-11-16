@@ -409,7 +409,7 @@ test('session context retains shared eligibility, tooltips and small meters with
   assert.equal(page.querySelector('.notch-active-context-fill'), null);
   assert.equal(page.querySelector('.notch-active-cost'), null, 'both priced and partially priced sessions omit cost');
   const runningContext = active[0].querySelector('.notch-session-context');
-  assert.deepEqual(runningContext.tooltipEntries.map(entry => entry.full), ['74K / 200K', 'Cache ~29m left']);
+  assert.deepEqual(runningContext.tooltipEntries.map(entry => entry.full), ['74K / 200K']);
   const recent = page.querySelectorAll('.notch-recent');
   assert.equal(recent[0].querySelector('.notch-session-context-value').textContent, '37%', 'a freshly ended turn retains context');
   assert.equal(recent[1].querySelector('.notch-session-cache').textContent, 'Cache 20m');
@@ -438,12 +438,18 @@ for (const client of ['codex', 'claude']) test(`${client} Notch Home, active and
   ];
   f.panel.render(data);
   const home = f.find('notch-now-meta');
-  assert.ok(home.textContent.includes(`${client === 'codex' ? 'Codex' : 'Claude Code'} · 2 models · high`));
+  const toolName = client === 'codex' ? 'Codex' : 'Claude Code';
+  assert.ok(home.textContent.includes('2 models · high'));
+  assert.equal(home.textContent.includes(toolName), false, 'the heading icon already names the tool');
+  assert.equal(f.find('notch-now').querySelector('.notch-session-heading').querySelector('.sr-only').textContent, `${toolName} `);
   assert.equal(home.querySelector('.session-models').tooltipEntries.length, 2, 'model breakdown retains its tooltip');
   f.panel.selectPage('sessions');
   const page = f.find('notch-page-sessions');
   const active = page.querySelectorAll('.notch-active');
   assert.deepEqual(active.map(node => node.querySelector('.session-reasoning-effort').textContent), ['high', 'xhigh']);
+  assert.equal(active[0].querySelector('.notch-active-meta').textContent.includes(toolName), false);
+  assert.equal(active[0].querySelector('.notch-session-heading').querySelector('.sr-only').textContent, `${toolName} `);
+  assert.ok(active[0].querySelector('.notch-active-meta').textContent.includes('2 models · high'));
   const recent = page.querySelectorAll('.notch-recent');
   assert.deepEqual(recent.map(node => node.querySelector('.session-reasoning-effort')?.textContent), ['medium', 'high', undefined]);
   assert.equal(recent[0].querySelector('.notch-session-context'), null);
@@ -453,6 +459,65 @@ for (const client of ['codex', 'claude']) test(`${client} Notch Home, active and
     assert.equal(setting.getAttribute('tabindex'), undefined);
     assert.ok(setting.getAttribute('aria-label'));
   }
+});
+
+test('Notch replaces session age with weighted cache hit usage from projected sessions', t => {
+  const f = panelFixture(t), data = payload();
+  const now = Date.now();
+  const row = (id, extra = {}) => ({ client: 'codex', sessionId: id, title: id,
+    totalTokens: 100, models: { 'gpt-test': 100 }, reasoningEffort: 'high',
+    startedAt: new Date(now - 109 * 3600000).toISOString(), lastUsedAt: new Date(now).toISOString(),
+    ...extra });
+  const sessions = {
+    'codex:parent': row('parent', { inputTokens: 80, cacheReadTokens: 20 }),
+    'codex:child': row('child', { parentSessionId: 'parent', inputTokens: 100, cacheReadTokens: 800, cacheWriteTokens: 100 })
+  };
+  const render = () => {
+    const snapshot = Object.fromEntries(Object.entries(sessions).map(([key, value]) => [key, { ...value }]));
+    data.cells = buildEdgeDockCells({ periods: { month: { sessions: snapshot } } }, { items: [{ type: 'stat', metric: 'sessions' }] });
+    f.panel.render(data);
+  };
+  render();
+  assert.equal(f.find('notch-now-meta').textContent, 'gpt-test · high · Cache 75%');
+  f.panel.selectPage('sessions');
+  assert.equal(f.find('notch-active-meta').textContent, 'gpt-test · high · Cache 75%');
+  delete sessions['codex:child'];
+  for (const field of ['inputTokens', 'cacheReadTokens']) delete sessions['codex:parent'][field];
+  render();
+  assert.equal(f.find('notch-active-meta').textContent, 'gpt-test · high');
+  sessions['codex:parent'].inputTokens = 100;
+  sessions['codex:parent'].cacheReported = true;
+  render();
+  assert.equal(f.find('notch-active-meta').textContent, 'gpt-test · high · Cache 0%');
+  sessions['codex:parent'].liveActivity = { state: 'waiting', observedAt: new Date(now).toISOString() };
+  render();
+  assert.equal(f.find('notch-active-meta').querySelector('.notch-session-cache-hit').textContent, '0%');
+  sessions['codex:parent'].turnEnded = true;
+  delete sessions['codex:parent'].liveActivity;
+  f.panel.selectPage('home');
+  render();
+  assert.equal(f.find('notch-now-meta').textContent, 'gpt-test · high · 0% · just now');
+  sessions['codex:parent'].tokenDataUnavailable = true;
+  render();
+  assert.equal(f.find('notch-now-meta').textContent, 'gpt-test · high · just now');
+});
+
+for (const client of ['codex', 'claude']) test(`resumed ${client} native activity displays the accounting cache rate`, t => {
+  const f = panelFixture(t), data = payload(), now = Date.now();
+  const key = `${client}:resumed`;
+  const session = { client, sessionId: 'resumed', title: 'resumed',
+    lastUsedAt: new Date(now).toISOString(), totalTokens: 100,
+    models: { 'test-model': 100 }, inputTokens: 20, cacheReadTokens: 80 };
+  data.cells = buildEdgeDockCells({
+    periods: { month: { sessions: { [key]: { ...session, archived: true } } } },
+    nativeSessions: { today: { [key]: { client, sessionId: 'resumed',
+      lastUsedAt: session.lastUsedAt, tokenDataUnavailable: true,
+      totalTokens: 0, costUsd: 0, models: {} } } }
+  }, { items: [{ type: 'stat', metric: 'sessions' }] });
+  f.panel.render(data);
+  assert.equal(f.find('notch-now-meta').textContent, 'test-model · Cache 80%');
+  f.panel.selectPage('sessions');
+  assert.equal(f.find('notch-active-meta').textContent, 'test-model · Cache 80%');
 });
 
 test('cache expiry refreshes within the same minute without a new stats push', t => {
@@ -586,7 +651,8 @@ test('quiet sessions use concise age metadata and explicit empty-state copy', t 
   data.cells[1].sessions = [{ key: 'codex:old', client: 'codex', sessionId: 'old', title: 'Previous task',
     models: { 'model-a': 1 }, totalTokens: 1, lastUsedAt: new Date(Date.now() - 660000).toISOString() }];
   f.panel.render(data);
-  assert.match(f.find('notch-now-meta').textContent, /^Codex · model-a · /);
+  assert.match(f.find('notch-now-meta').textContent, /^model-a · /);
+  assert.doesNotMatch(f.find('notch-now-meta').textContent, /Codex/);
   assert.doesNotMatch(f.find('notch-now-meta').textContent, /Last active/);
   assert.equal(f.find('notch-now-caption'), null);
   assert.match(f.find('notch-now-tokens').attributes['aria-label'], /last session.*1/i);
@@ -594,7 +660,7 @@ test('quiet sessions use concise age metadata and explicit empty-state copy', t 
   assert.match(f.find('notch-sessions-empty').textContent, /^No active sessionsLast active: /);
 });
 
-test('session titles use shared hover reading and hand it across live updates', t => {
+test('session titles retain the same reading node across live updates', t => {
   const f = panelFixture(t), data = payload();
   data.cells[1].sessions = [{ key: 'codex:long', client: 'codex', sessionId: 'long', title: 'A long session title',
     totalTokens: 1, lastUsedAt: new Date(Date.now()).toISOString() }];
@@ -603,10 +669,59 @@ test('session titles use shared hover reading and hand it across live updates', 
   assert.ok(f.overflowText.bound.includes(previous));
   assert.equal(previous.title, undefined, 'normal hover uses the app reader instead of a native title popup');
   data.cells[1].sessions[0].totalTokens += 1; f.panel.render(data);
-  assert.equal(f.find('notch-now-title').dataset.overflowKey, previous.dataset.overflowKey);
-  assert.equal(f.overflowText.preserved.at(-1).previous.contains(previous), true);
+  assert.equal(f.find('notch-now-title').dataset.key, previous.dataset.key);
+  assert.equal(f.find('notch-now-title'), previous);
   const current = f.find('notch-now-title'); f.panel.suspend();
   assert.ok(f.overflowText.stopped.includes(current));
+});
+
+test('home month follows the hovered or focused day and resets to the current month', t => {
+  const f = panelFixture(t), data = payload();
+  data.panel.week.days[0].date = '2026-09-30';
+  f.panel.render(data);
+  assert.equal(f.find('notch-week-title').textContent, 'October');
+  f.all('notch-day')[0].fire('pointerenter');
+  assert.equal(f.find('notch-week-title').textContent, 'September');
+  f.find('notch-week-bars').fire('pointerleave');
+  assert.equal(f.find('notch-week-title').textContent, 'October');
+  f.all('notch-day')[0].fire('focus');
+  assert.equal(f.find('notch-week-title').textContent, 'September');
+  f.all('notch-day')[0].fire('blur');
+  assert.equal(f.find('notch-week-title').textContent, 'October');
+});
+
+test('hovering an unknown day retains its month across usage pushes', t => {
+  const f = panelFixture(t), data = payload();
+  data.panel.week.days[0] = { date: '2026-09-30', tokens: null };
+  f.panel.render(data);
+  f.all('notch-day')[0].fire('pointerenter');
+  assert.equal(f.find('notch-week-title').textContent, 'September');
+  data.cells[0].totalTokens = 200;
+  f.panel.render(data);
+  assert.equal(f.find('notch-week-title').textContent, 'September');
+  assert.equal(f.find('notch-big').textContent, '200');
+  f.find('notch-week-bars').fire('pointerleave');
+  assert.equal(f.find('notch-week-title').textContent, 'October');
+});
+
+test('leaving a day after a month boundary shows the new current month', t => {
+  const f = panelFixture(t);
+  f.panel.render(payload());
+  f.all('notch-day')[0].fire('pointerenter');
+  t.mock.timers.setTime(new Date(2026, 10, 1, 12).getTime());
+  f.find('notch-week-bars').fire('pointerleave');
+  assert.equal(f.find('notch-week-title').textContent, 'November');
+});
+
+test('returning Home clears the hovered month after a page change', t => {
+  const f = panelFixture(t), data = payload();
+  data.panel.week.days[0].date = '2026-09-30';
+  f.panel.render(data);
+  f.all('notch-day')[0].fire('pointerenter');
+  f.panel.selectPage('limits');
+  f.panel.selectPage('home');
+  assert.equal(f.find('notch-week-title').textContent, 'October');
+  assert.equal(f.find('notch-big').textContent, '100');
 });
 
 test('scrubbing freezes the historical reading and returning applies the latest push immediately', t => {
@@ -682,6 +797,16 @@ test('breakdown shows tools and models together and switches both to the same pe
   assert.match(f.find('notch-breakdown-model').textContent, /gemini/);
   assert.deepEqual(f.all('notch-rank-share').map(node => node.textContent), ['100%', '100%']);
   assert.equal(f.document.activeElement.attributes['aria-pressed'], 'true', 'period switching preserves keyboard focus');
+});
+
+test('Breakdown fits the retained live token figure after an update', t => {
+  const f = panelFixture(t);
+  f.panel.render(payload()); f.panel.selectPage('breakdown');
+  const figure = f.find('notch-breakdown-tokens');
+  figure.clientWidth = 100; figure.scrollWidth = 200;
+  f.panel.render(payload(200));
+  assert.equal(f.find('notch-breakdown-tokens'), figure);
+  assert.equal(figure.style.fontSize, '18px');
 });
 
 test('pointer and keyboard inspection only highlight the matching column spectrum', t => {
@@ -822,10 +947,10 @@ test('limit columns past one page scroll a page per wheel gesture and keep their
   assert.equal(strip.scrollLeft, 120);
   assert.equal(f.find('notch-pager').children[1].classList.contains('is-selected'), true);
   assert.equal(strip.classList.contains('has-after'), false);
-  // A later push rebuilds the strip on the same page.
+  // A later push updates the same strip on the same page.
   records[0].windows[0].remainingPercent = 10;
   f.panel.render({ ...payload(), cells: buildEdgeDockCells({ limits: { providers: records } }, { items: [{ type: 'limit', provider: 'codex' }] }) });
-  assert.notEqual(f.find('notch-limits'), strip);
+  assert.equal(f.find('notch-limits'), strip);
   assert.equal(f.find('notch-limits').scrollLeft, 120);
   // Horizontal swipes stay native; a new vertical gesture steps back.
   f.find('notch-limits').fire('wheel', { deltaX: 40, deltaY: 2, preventDefault: () => { prevented += 1; } });
@@ -835,6 +960,28 @@ test('limit columns past one page scroll a page per wheel gesture and keep their
   assert.equal(f.find('notch-limits').scrollLeft, 0);
 });
 
+
+test('a retained single-page limits strip gains pagination when accounts arrive', t => {
+  const f = panelFixture(t);
+  const providers = Array.from({ length: 4 }, (_, index) => ({ provider: 'codex', status: 'ok', accountKey: String(index),
+    windows: [{ kind: 'weekly', remainingPercent: 50 }] }));
+  const data = count => ({ ...payload(), cells: buildEdgeDockCells({ limits: { providers: providers.slice(0, count) } }, { items: [{ type: 'limit', provider: 'codex' }] }) });
+  f.panel.render(data(1)); f.panel.selectPage('limits');
+  const strip = f.find('notch-limits');
+  let prevented = 0;
+  const wheel = () => strip.fire('wheel', { deltaX: 0, deltaY: 30, preventDefault() { prevented++; } });
+  wheel(); assert.equal(prevented, 0, 'one page leaves vertical scrolling alone');
+  f.panel.render(data(4));
+  assert.equal(f.find('notch-limits'), strip);
+  assert.equal(f.find('notch-pager').children.length, 2);
+  wheel();
+  assert.equal(prevented, 1);
+  assert.equal(strip.scrollLeft, 120);
+  assert.equal(f.find('notch-pager').children[1].getAttribute('aria-pressed'), 'true');
+  strip.scrollLeft = 0; strip.fire('scroll');
+  assert.equal(f.panel.view.limitPage, 0);
+  assert.equal(f.find('notch-pager').children[0].getAttribute('aria-pressed'), 'true');
+});
 
 test('the first limits wheel gesture works after a quick close and reopen', t => {
   const f = panelFixture(t);
@@ -1147,15 +1294,26 @@ test('home quota groups fill the available width and resize without losing the r
     accounts: [{ record: { provider: `provider-${index}`, status: 'ok', windows: [{ kind: 'session', remainingPercent: 75 }] } }] })));
   f.panel.render(data);
   const row = f.find('notch-fuel');
+  f.window.getComputedStyle = target => {
+    for (const item of target.children) if (item.classList.contains('notch-fuel-item')) item.offsetWidth = 70;
+    return { columnGap: '12px' };
+  };
   let width = 300;
   Object.defineProperties(row, {
     clientWidth: { get: () => width },
-    scrollWidth: { get: () => row.children.reduce((sum, child) => sum + (child.classList.contains('notch-fuel-item') ? 70 : 20), 0)
-      + Math.max(0, row.children.length - 1) * 12 }
+    scrollWidth: { get: () => row.children.filter(child => !child.hidden).reduce((sum, child) => sum + (child.classList.contains('notch-fuel-item') ? 70 : 20), 0)
+      + Math.max(0, row.children.filter(child => !child.hidden).length - 1) * 12 }
   });
   f.resize();
   assert.equal(f.all('notch-fuel-item').length, 3, 'the freed caption space can hold a third complete group');
   assert.equal(f.find('notch-fuel-more').textContent, '+5');
+  const more = f.find('notch-fuel-more'); more.focus();
+  for (let i = 0; i < 2; i++) {
+    data.cells[0].totalTokens++; f.panel.render(data);
+    assert.equal(f.find('notch-fuel-more'), more);
+    assert.equal(more.hidden, false);
+    assert.equal(f.document.activeElement, more);
+  }
   assert.equal(f.find('notch-fuel-caption'), null);
   assert.equal(row.attributes['aria-label'], 'limits left');
   width = 170; f.resize();
@@ -1163,7 +1321,7 @@ test('home quota groups fill the available width and resize without losing the r
   assert.equal(f.find('notch-fuel-more').textContent, '+7');
   width = 700; f.resize();
   assert.equal(f.all('notch-fuel-item').length, 8, 'widening restores groups that were previously hidden');
-  assert.equal(f.find('notch-fuel-more'), null);
+  assert.equal(f.find('notch-fuel-more').hidden, true);
   width = 300; f.resize();
   f.find('notch-fuel-more').fire('click', { detail: 0 });
   assert.equal(f.panel.view.page, 'limits');
@@ -1361,6 +1519,11 @@ test('plugin navigation artwork arrives from metadata before page mount and refr
   const icon = f.all('notch-tab-plugin-icon')[0];
   assert.equal(icon.querySelector('img')?.src, data.panel.pluginCatalog['demo/panel'].identityIcon);
   assert.equal(mounts, 0);
+  data.panel.pluginCatalog['demo/panel'].presentation = { icon: { native: 'codex' } };
+  f.panel.render(data);
+  assert.ok(icon.querySelector('img')?.src.endsWith('/codex.svg'), 'presentation-only changes repaint without author UI');
+  assert.equal(mounts, 0);
+  delete data.panel.pluginCatalog['demo/panel'].presentation;
   data.panel.pluginCatalog['demo/panel'].identityIcon = '';
   f.panel.render(data);
   assert.equal(icon.querySelector('img'), null);
@@ -1420,4 +1583,26 @@ test('swipe previews keep plugin header tools hidden until the page is selected'
   assert.equal(mounts[0][3].headerActions.parentNode, null);
   f.panel.selectPage('plugin:demo/panel');
   assert.equal(mounts.at(-1)[3].headerActions.hidden, false);
+});
+
+test('linked MiniMax API keys keep distinct Notch column labels', t => {
+  const f = panelFixture(t);
+  const codeKey = `sha256:${'a'.repeat(64)}`;
+  const records = [
+    { provider: 'minimax', source: 'oauth', status: 'ok', region: 'cn',
+      accountKey: codeKey, accountLabel: 'MiniMax Code', windows: [{ kind: 'weekly', usedPercent: 20 }] },
+    ...['b', 'c'].map(letter => ({ provider: 'minimax', source: 'api', status: 'ok',
+      region: 'cn', accountKey: `sha256:${letter.repeat(64)}`, relatedAccountKey: codeKey,
+      accountLabel: 'Pay-as-you-go', windows: [{ kind: 'billing', metric: 'credits',
+        remaining: 12, currency: 'CNY' }] }))
+  ];
+  const cells = buildEdgeDockCells({ limits: { providers: records } },
+    { items: [{ type: 'limit', provider: 'minimax' }] });
+  f.panel.render({ ...payload(), cells });
+  f.panel.selectPage('limits');
+  const names = f.all('notch-limit-account').map(node => node.textContent);
+  assert.equal(names.length, 3);
+  assert.equal(names[0], 'MiniMax Code');
+  assert.ok(names[1] && names[2], 'each API column has its own visible label');
+  assert.notEqual(names[1], names[2], 'separate keys must remain distinguishable');
 });

@@ -310,7 +310,7 @@ test('unmounted async redraw is cleared after release, including a connected pag
   assert.equal(node.isConnected, true); assert.equal(disposals, 1); assert.equal(node.children.length, 0);
   await host.dispose();
 });
-test('old asynchronous disposal never clears a newer mount in the same container', async () => {
+test('old asynchronous disposal settles before a newer mount owns the same container', async () => {
   const document = dom(), node = document.createElement('div'); document.body.append(node);
   let finish;
   const host = createHost({ document, window: {}, bridge: {}, importModule: async url => ({ mount(container) {
@@ -318,8 +318,10 @@ test('old asynchronous disposal never clears a newer mount in the same container
     return url.includes('/one/') ? { dispose: () => new Promise(resolve => { finish = resolve; }) } : {};
   } }) });
   await host.mount(node, descriptor); host.unmount(node);
-  await host.mount(node, { ...descriptor, revision: 'two', entry: 'tm-plugin://fixture/two/ui.mjs' });
-  const replacement = node.children[0]; finish(); await new Promise(setImmediate);
+  const next = host.mount(node, { ...descriptor, revision: 'two', entry: 'tm-plugin://fixture/two/ui.mjs' });
+  await new Promise(setImmediate); assert.equal(node.children.length, 0);
+  finish(); await next;
+  const replacement = node.children[0]; await new Promise(setImmediate);
   assert.equal(node.children[0], replacement); assert.equal(node.children.length, 1); await host.dispose();
 });
 test('host announces plugin ownership before import and again after release/resume', async () => {
@@ -357,7 +359,7 @@ for (const outcome of ['resolve', 'reject', 'dispose-reject']) test(`removed pen
   assert.equal((await lifecycle({ action: 'inspect', ids: ['fixture'] })).loaded, false);
   await host.dispose();
 });
-for (const rejected of [false, true]) test(`stale pending mount ${rejected ? 'rejection' : 'disposal'} preserves newer owner`, async () => {
+for (const rejected of [false, true]) test(`stale pending mount ${rejected ? 'rejection' : 'disposal'} drains before newer owner`, async () => {
   const document = dom(), node = document.createElement('div'); document.body.append(node);
   let finish, entered;
   const started = new Promise(resolve => { entered = resolve; });
@@ -370,9 +372,11 @@ for (const rejected of [false, true]) test(`stale pending mount ${rejected ? 're
     container.append(document.createElement('input')); return {};
   } }) });
   const old = host.mount(node, descriptor); await started; host.unmount(node);
-  await host.mount(node, { ...descriptor, revision: 'two', entry: 'tm-plugin://fixture/two/ui.mjs' });
+  const next = host.mount(node, { ...descriptor, revision: 'two', entry: 'tm-plugin://fixture/two/ui.mjs' });
+  await new Promise(setImmediate); assert.equal(node.children.length, 0);
+  finish(); await Promise.all([old, next]);
   const replacement = node.children[0]; replacement.value = 'new draft';
-  finish(); await old;
+  await new Promise(setImmediate);
   assert.equal(node.children.length, 1); assert.equal(node.children[0], replacement); assert.equal(replacement.value, 'new draft');
   await host.dispose();
 });
@@ -404,6 +408,7 @@ test('navigation artwork is static metadata and decode errors restore the named 
   const image = icon.querySelector('img');
   assert.equal(image.src, 'data:image/png;base64,bad');
   assert.equal(image.alt, '');
+  assert.equal(image.draggable, false, 'identity icons do not start browser image drags');
   assert.equal(image.width, 15);
   image.fire('error');
   assert.equal(icon.querySelector('img'), null);
@@ -440,8 +445,9 @@ test('header slots isolate late mounts and release actions on update failure', a
   const pending = host.mount(node, descriptor, { headerActions: actions }); await new Promise(setImmediate);
   host.unmount(node); assert.equal(actions.children.length, 0);
   const next = { ...descriptor, ref: 'fixture/next' };
-  await host.mount(node, next, { headerActions: actions }); const owned = actions.children[0];
-  finish(); await pending;
+  const replacement = host.mount(node, next, { headerActions: actions });
+  await new Promise(setImmediate); assert.equal(actions.children.length, 0);
+  finish(); await Promise.all([pending, replacement]); const owned = actions.children[0];
   assert.equal(actions.children.length, 1); assert.equal(actions.children[0], owned);
   await host.mount(node, next, {}); assert.equal(actions.children.length, 0);
   await host.dispose();
@@ -467,4 +473,213 @@ test('reused mounts move header controls without replacing drafts and remove omi
   await host.mount(node, descriptor, { headerActions: a });
   assert.equal(a.children[0], latest.headerActions); assert.notEqual(latest.headerActions, mount);
   await host.dispose(); assert.equal(a.children.length, 0);
+});
+
+for (const target of ['main.home.content', 'main.tools.content', 'edgeDock.rail.stat.content', 'edgeDock.stat.content', 'notch.home.content', 'notch.summary.content']) {
+  test(`${target} keeps successful replacement hidden throughout a delayed same-view update`, async () => {
+    const document = dom(), native = document.createElement('div'); native.hidden = false; document.body.append(native);
+    const view = { ...descriptor, targets: [target] }; let finish;
+    const host = createHost({ document, window: {}, bridge: {}, importModule: async () => ({ mount(container) {
+      container.append(document.createElement('input'));
+      return { update: () => new Promise(resolve => { finish = resolve; }) };
+    } }) });
+    const content = create({ document, host, getViews: () => [view], selection: () => view.ref });
+    content.render(target, native); await new Promise(setImmediate);
+    assert.equal(native.hidden, true);
+    const container = native.nextSibling, input = container.children[0]; input.value = 'retained draft';
+    content.render(target, native);
+    assert.equal(native.hidden, true, 'native rows must not reappear while the update awaits');
+    assert.equal(container.children[0], input); assert.equal(input.value, 'retained draft');
+    finish(); await new Promise(setImmediate); assert.equal(native.hidden, true);
+    const rebuilt = document.createElement('div'); rebuilt.hidden = false; native.parentNode.insertBefore(rebuilt, native); native.remove();
+    content.retain([target]);
+    content.render(target, rebuilt);
+    assert.equal(rebuilt.hidden, true, 'rebuilt Dock/Notch anchors retain the successful same-revision replacement');
+    assert.equal(rebuilt.nextSibling, container); assert.equal(container.children[0], input);
+    finish(); await new Promise(setImmediate); assert.equal(rebuilt.hidden, true);
+    content.dispose(); assert.equal(rebuilt.hidden, false); await host.dispose();
+  });
+}
+test('pending replacement update restores native on failure or deselection and cannot hide it after removal', async () => {
+  for (const outcome of ['failure', 'deselection']) {
+    const document = dom(), native = document.createElement('div'); native.hidden = false; document.body.append(native);
+    let finish, fail, selected = descriptor.ref;
+    const host = createHost({ document, window: {}, bridge: {}, onError() {}, importModule: async () => ({ mount() {
+      return { update: () => new Promise((resolve, reject) => { finish = resolve; fail = reject; }) };
+    } }) });
+    const content = create({ document, host, getViews: () => [descriptor], selection: () => selected });
+    content.render('main.home.content', native); await new Promise(setImmediate);
+    content.render('main.home.content', native); assert.equal(native.hidden, true);
+    if (outcome === 'failure') fail(Error('update failed'));
+    else { selected = null; content.render('main.home.content', native); assert.equal(native.hidden, false); finish(); }
+    await new Promise(setImmediate); assert.equal(native.hidden, false);
+    content.dispose(); await host.dispose();
+  }
+});
+
+test('retain releases detached replacement mounts when their view is no longer selected', () => {
+  const document = dom(), native = document.createElement('div'); native.hidden = false; document.body.append(native);
+  let selected = descriptor.ref, removed = 0;
+  const content = create({ document, getViews: () => [descriptor], selection: () => selected,
+    host: { mount(_node, _view, context) { context.onMountStatus(true); }, unmount() { removed++; } } });
+  content.render('main.home.content', native); native.remove(); selected = null;
+  content.retain(['main.home.content']); assert.equal(removed, 1); assert.equal(document.body.children.length, 0);
+  content.dispose();
+});
+
+for (const mode of ['append', 'decorate']) {
+  test(`${mode} preserves native visibility changed by the App between renders`, () => {
+    const document = dom(), native = document.createElement('div'); native.hidden = false; document.body.append(native);
+    const view = { ...descriptor, mode };
+    const content = create({ document, getViews: () => [view], host: { mount() {}, unmount() {} } });
+    content.render('main.home.content', native);
+    native.hidden = true; content.render('main.home.content', native);
+    assert.equal(native.hidden, true);
+    native.hidden = false; content.render('main.home.content', native);
+    assert.equal(native.hidden, false);
+    content.dispose();
+  });
+}
+
+test('retain releases an inactive detached replacement while an append view uses the same target', () => {
+  const document = dom(), native = document.createElement('div'); native.hidden = false; document.body.append(native);
+  const append = { ...descriptor, ref: 'other/append', mode: 'append' };
+  let selected = descriptor.ref; const removed = [];
+  const content = create({ document, getViews: () => [descriptor, append], selection: () => selected,
+    host: { mount(_node, _view, context) { context.onMountStatus(true); }, unmount(node) { removed.push(node); } } });
+  content.render('main.home.content', native);
+  const replacementNode = native.nextSibling, appendNode = replacementNode.nextSibling;
+  native.remove(); selected = null;
+  content.retain(['main.home.content']);
+  assert.deepEqual(removed, [replacementNode]);
+  assert.equal(appendNode.isConnected, true);
+  content.dispose(); assert.deepEqual(removed, [replacementNode, appendNode]);
+});
+
+for (const initiallyHidden of [true, false]) {
+  test(`replacement captures App visibility after an append-only outlet starts hidden=${initiallyHidden}`, () => {
+    const document = dom(), native = document.createElement('div'); native.hidden = initiallyHidden; document.body.append(native);
+    const append = { ...descriptor, ref: 'other/append', mode: 'append' };
+    let selected = null, status;
+    const content = create({ document, getViews: () => [append, descriptor], selection: () => selected,
+      host: { mount(_node, view, context) { if (view.mode === 'replace') status = context.onMountStatus; }, unmount() {} } });
+    content.render('main.home.content', native);
+    native.hidden = !initiallyHidden; selected = descriptor.ref;
+    content.render('main.home.content', native);
+    assert.equal(native.hidden, !initiallyHidden, 'pending replacement preserves current App visibility');
+    status(false);
+    assert.equal(native.hidden, !initiallyHidden, 'failed mount restores current App visibility');
+    content.render('main.home.content', native); status(true);
+    assert.equal(native.hidden, true);
+    selected = null; content.render('main.home.content', native);
+    assert.equal(native.hidden, !initiallyHidden, 'deselection restores the replacement-start snapshot');
+    content.dispose();
+  });
+}
+test('offscreen author quota views stay invisible through context repaint', async () => {
+  const { createPluginViewHost } = require('../../src/electron/renderer/pluginViews');
+  const document = dom(); document.addEventListener = document.removeEventListener = () => {};
+  let intersection, frame; const paints = [];
+  const window = { requestAnimationFrame: fn => { frame = fn; return 1; }, cancelAnimationFrame() {},
+    IntersectionObserver: class { constructor(callback) { intersection = callback; } observe() {} disconnect() {} },
+    TokenMonitorPluginUi: { createHost: () => ({ mount(_node, _value, context) { paints.push(context.visible); }, unmount() {}, sweep() {}, setVisibility() {}, dispose() {} }) } };
+  const host = createPluginViewHost({ document, window });
+  host.update({ surface: 'settings', views: { [descriptor.ref]: descriptor } });
+  const node = document.createElement('div'); node.style.removeProperty = () => {}; node.getClientRects = () => [{}]; document.body.append(node);
+  host.mount(node, descriptor.ref, 'settings', { isVisible: () => true });
+  intersection([{ target: node, isIntersecting: false }]); frame();
+  host.refreshContext(); assert.equal(paints.at(-1), false);
+  intersection([{ target: node, isIntersecting: true }]); frame();
+  host.refreshContext(); assert.equal(paints.at(-1), true);
+  await host.dispose();
+});
+
+
+test('shared presentation resolves live palette overrides and renders native, image and mask artwork', () => {
+  const document = dom(); document.createElementNS = (_namespace, tag) => document.createElement(tag);
+  const {navigationIcon,presentationColor} = require('../../src/electron/renderer/pluginViews');
+  const palette={codex:'#49a3b0',default:'#aaaaaa'};
+  assert.equal(presentationColor({color:{palette:'codex'}},palette),'#49a3b0');
+  palette.codex='#123456';
+  assert.equal(presentationColor({color:{palette:'codex'}},palette),'#123456');
+  assert.equal(presentationColor({color:{hex:'#abcdef'}},palette),'#abcdef');
+  assert.equal(presentationColor({},palette),'#aaaaaa');
+  const native=navigationIcon(document,{presentation:{icon:{native:'codex'}}});
+  const probe=native.querySelector('img'); assert.ok(probe.src.endsWith('/codex.svg')); probe.fire('load');
+  const mark=native.children[0]; assert.equal(mark.className,'row-icon-codex'); assert.equal(mark.style.backgroundColor,'currentColor'); assert.ok(mark.style.maskImage.includes('/codex.svg'));
+  for (const mode of ['image','mask']) {
+    const data='data:image/svg+xml;base64,PHN2Zy8+';
+    const node=navigationIcon(document,{presentation:{icon:{data,mode}}});
+    const img=node.querySelector('img'); assert.equal(img.src,data); assert.equal(img.draggable,false); img.fire('load');
+    assert.equal(Boolean(node.querySelector('img')),mode==='image');
+    if(mode==='mask') assert.ok(node.children[0].style.maskImage.includes(data));
+  }
+  const fallback=navigationIcon(document,{identityIcon:'data:image/png;base64,fallback',presentation:{icon:{native:'codex'}}});
+  fallback.querySelector('img').fire('error'); assert.equal(fallback.querySelector('img').src,'data:image/png;base64,fallback');
+  fallback.querySelector('img').fire('error'); assert.ok(fallback.querySelector('path'));
+});
+
+test('unattended update inspection checks host settings without loading author code', async () => {
+  let lifecycle, editing = true;
+  const host = createHost({ document: {}, window: {}, bridge: { onLifecycle(callback) { lifecycle = callback; } },
+    services: { updatesBlocked: ids => editing && ids.includes('fixture') }, importModule: () => assert.fail('inspection must not load code') });
+  assert.deepEqual(await lifecycle({ action: 'inspect-update', ids: ['fixture'] }), { blocked: true });
+  assert.deepEqual(await lifecycle({ action: 'inspect-update', ids: ['another'] }), { blocked: false });
+  editing = false;
+  assert.deepEqual(await lifecycle({ action: 'inspect-update', ids: ['fixture'] }), { blocked: false });
+  await host.dispose();
+});
+
+for (const reason of ['draft', 'settings']) test(`automatic release rechecks ${reason} after pending updates settle`, async () => {
+  const document = dom(), node = document.createElement('div'); document.body.append(node);
+  let lifecycle, finish, editing = false, disposals = 0;
+  const host = createHost({ document, window: {}, bridge: { onLifecycle(callback) { lifecycle = callback; } },
+    services: { updatesBlocked: () => editing }, importModule: async () => ({ mount(container) {
+      const input = document.createElement('input'); container.append(input);
+      return { hasUnsavedChanges: () => Boolean(input.value),
+        update: () => new Promise(resolve => { finish = resolve; }), dispose() { disposals++; container.replaceChildren(); } };
+    } }) });
+  await host.mount(node, descriptor); const input = node.children[0];
+  assert.equal((await lifecycle({ action: 'inspect', ids: ['fixture'] })).unsaved, false);
+  host.setVisibility(node, false);
+  const releasing = lifecycle({ action: 'release', ids: ['fixture'], automatic: true });
+  await new Promise(setImmediate);
+  if (reason === 'draft') input.value = 'new draft'; else editing = true;
+  finish();
+  assert.equal((await releasing).deferred, true);
+  assert.equal(disposals, 0); assert.equal(node.children[0], input);
+  await lifecycle({ action: 'resume', ids: ['fixture'] });
+  assert.equal((await lifecycle({ action: 'inspect', ids: ['fixture'] })).loaded, true);
+  await host.dispose();
+});
+
+
+test('automatic deferral does not conceal an existing author cleanup failure', async () => {
+  const document = dom(), a = document.createElement('div'), b = document.createElement('div'); document.body.append(a, b);
+  let lifecycle;
+  const host = createHost({ document, window: {}, bridge: { onLifecycle(callback) { lifecycle = callback; } },
+    importModule: async () => ({ mount(container) { return { hasUnsavedChanges: () => container === b,
+      dispose() { if (container === a) throw Error('known cleanup failure'); } }; } }) });
+  await host.mount(a, descriptor); await host.mount(b, descriptor); host.unmount(a);
+  await new Promise(setImmediate);
+  await assert.rejects(lifecycle({ action: 'release', ids: ['fixture'], automatic: true }), /known cleanup failure/);
+  await host.dispose();
+});
+
+
+test('automatic lifecycle holds native settings lock until resume completes', async () => {
+  const document = dom(), node = document.createElement('div'); document.body.append(node);
+  let lifecycle, locked = false, unlock;
+  const host = createHost({ document, window: {}, bridge: { onLifecycle(callback) { lifecycle = callback; } },
+    services: { setUpdatingPlugins(ids, active) {
+      assert.deepEqual(ids, ['fixture']);
+      if (active) locked = true;
+      else return new Promise(resolve => { unlock = () => { locked = false; resolve(); }; });
+    } }, importModule: async () => ({ mount() { return {}; } }) });
+  await host.mount(node, descriptor);
+  await lifecycle({ action: 'release', ids: ['fixture'], automatic: true });
+  assert.equal(locked, true);
+  const resuming = lifecycle({ action: 'resume', ids: ['fixture'] });
+  assert.equal(locked, true); unlock(); await resuming;
+  assert.equal(locked, false); await host.dispose();
 });

@@ -1,9 +1,11 @@
 'use strict';
 
 const fs = require('node:fs');
+const { normalizeLatestModel } = require('./usage');
 const { isCompressedCodexTranscript, readCompressedCodexTranscript } = require('./providers/codex/transcript');
 const os = require('node:os');
 const { hashKey } = require('./hashKey');
+const { resolveProjectRoot } = require('./projectRoot');
 const { normalizeSessionContext } = require('./sessionContext');
 const { normalizeReasoningEffort, isSessionReasoningEffortClient } = require('./sessionLive');
 const claudeSessionMetadata = require('./providers/claude/sessionMetadata');
@@ -192,13 +194,22 @@ function normalizeProjectPath(value) {
   return windows ? normalized.toLowerCase() : normalized;
 }
 
-function projectIdentity(value) {
-  const normalized = normalizeProjectPath(value);
-  if (!normalized) return {};
+// One spelling per path: the resolver remembers worktrees by it, so a trailing
+// slash or backslashes must not make a second key for the same directory.
+function spellProjectPath(value) {
+  const spelled = String(value || '').trim().replace(/\\/g, '/');
+  const normalized = normalizeProjectPath(spelled);
   const root = normalized === '/' || /^[a-z]:\/$/i.test(normalized);
-  let displayPath = String(value || '').trim().replace(/\\/g, '/');
-  if (!root) displayPath = displayPath.replace(/\/+$/, '');
-  const label = root ? (normalized === '/' ? '/' : `${normalized[0].toUpperCase()}:\\`) : displayPath.split('/').pop();
+  return { spelled: root ? spelled : spelled.replace(/\/+$/, ''), normalized, root };
+}
+
+// A directory's project is its repository: linked worktrees resolve to the
+// repository they were created from instead of naming a project each.
+function projectIdentity(value) {
+  const typed = spellProjectPath(value);
+  if (!typed.normalized) return {};
+  const { spelled, normalized, root } = spellProjectPath(resolveProjectRoot(typed.spelled, typed.normalized));
+  const label = root ? (normalized === '/' ? '/' : `${normalized[0].toUpperCase()}:\\`) : spelled.split('/').pop();
   return { projectId: hashKey('project', normalized), projectLabel: label };
 }
 
@@ -514,6 +525,7 @@ function applySessionMetadata(periods, home, deps = {}) {
       if (meta.projectId) session.projectId = meta.projectId;
       if (meta.projectLabel) session.projectLabel = meta.projectLabel;
       if (meta.sessionKind) session.sessionKind = meta.sessionKind;
+      if (Object.prototype.hasOwnProperty.call(meta, 'latestModel')) session.latestModel = normalizeLatestModel(meta.latestModel, session.client);
       if (Object.prototype.hasOwnProperty.call(meta, 'promptCache')) session.promptCache = meta.promptCache;
       if (isSessionReasoningEffortClient(session.client) && Object.prototype.hasOwnProperty.call(meta, 'reasoningEffort')) {
         session.reasoningEffort = normalizeReasoningEffort(meta.reasoningEffort);

@@ -1,9 +1,11 @@
+// @ts-check
 'use strict';
 
 // OpenRouter limits account wiring. Leaf module: no requires.
-module.exports = {
+module.exports = /** @satisfies {import('../../limits/accounts').AccountDeclaration} */ ({
   id: 'openrouter',
   fetch: 'fetchOpenRouterLimits',
+  accountRefresh: true,
   fields: [
     {
       key: 'openrouterProfiles',
@@ -21,4 +23,4 @@ module.exports = {
   urlPolicy: [
     { hosts: ['openrouter.ai'], pathPrefixes: ['/settings/keys'] }
   ]
-};
+});

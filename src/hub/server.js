@@ -1,6 +1,7 @@
 'use strict';
 
 const http = require('node:http');
+const { UPLOAD_HEADER, UPLOAD_VERSION, createUploadBaselines } = require('../shared/uploadDelta');
 const path = require('node:path');
 const { URL } = require('node:url');
 const {
@@ -23,6 +24,7 @@ const {
 const { CURRENCY_CODES, normalizeCurrency } = require('../shared/currency');
 const { currentHubBuild } = require('../shared/hubBuildIdentity');
 const {
+  SSE_BACKLOG_LIMIT_BYTES,
   encodeSseEvent,
   prepareSseFanout,
   sseClientKinds,
@@ -74,6 +76,7 @@ function createHub({
   store.syncTitlePolicies = Object.assign(Object.create(null), store.syncTitlePolicies || {});
   store.syncSettings = Object.assign(Object.create(null), store.syncSettings || {});
   const bindHost = resolveBindHost(host, secret);
+  const uploadBaselines = createUploadBaselines();
   let persistTimer = null;
   let persistPending = false;
   let stopping = false;
@@ -148,15 +151,19 @@ function createHub({
   let lastSseStats = null;
   let streamRevision = 0;
 
+  // Once write() reports backpressure, later frames still queue in order behind
+  // the frame in flight, up to SSE_BACKLOG_LIMIT_BYTES. Past that budget the
+  // connection skips frames and resyncs once its transport drains.
   function writeSseFrame(client, frame) {
     if (!frame) return false;
-    if (client.blocked) {
+    if (client.blocked && (client.needsSnapshot || client.res.writableLength + Buffer.byteLength(frame) > client.backlogLimit)) {
       client.needsSnapshot = true;
       return false;
     }
     try {
-      if (client.res.write(frame) === false) {
+      if (client.res.write(frame) === false && !client.blocked) {
         client.blocked = true;
+        client.backlogLimit = client.res.writableLength + SSE_BACKLOG_LIMIT_BYTES;
         client.res.once('drain', client.onDrain);
       }
       return true;
@@ -242,6 +249,7 @@ function createHub({
       throw new Error('deviceId_required');
     }
     const deviceId = String(payload.deviceId || payload.id);
+    uploadBaselines.forget(deviceId);
     const record = mergeSyncDeviceRecord(store.devices[deviceId], { ...payload, receivedAt: new Date().toISOString() }, {
       preserveSessionTitles: acceptsSessionTitles(serverTitlesEnabled, store.syncTitlePolicies[deviceId], payload.sessionTitleSyncGeneration)
     });
@@ -253,6 +261,7 @@ function createHub({
   }
 
   function deleteDevice(deviceId) {
+    uploadBaselines.forget(deviceId);
     // Commit deletion and revocation together, keeping a generation tombstone.
     const previousPolicy = store.syncTitlePolicies[deviceId];
     const previousDevice = store.devices[deviceId];
@@ -306,6 +315,7 @@ function createHub({
     const previous = store.syncTitlePolicies[deviceId];
     const next = nextTitlePolicy(previous, enabled);
     if (enabled && normalizeTitlePolicy(previous).enabled) return next;
+    uploadBaselines.forget(deviceId);
     const previousDevice = store.devices[deviceId];
     const previousSavedAt = store.savedAt;
     store.syncTitlePolicies[deviceId] = next;
@@ -445,7 +455,7 @@ function createHub({
         'connection': 'keep-alive',
         'x-accel-buffering': 'no'
       });
-      const client = { res, freshnessEvents: wantsFreshnessEvents(req), deltaEvents: wantsDeltaEvents(req), streamRevision: null, blocked: false, needsSnapshot: false };
+      const client = { res, freshnessEvents: wantsFreshnessEvents(req), deltaEvents: wantsDeltaEvents(req), streamRevision: null, blocked: false, backlogLimit: 0, needsSnapshot: false };
       let heartbeat = null;
       client.cleanup = () => {
         clearInterval(heartbeat);
@@ -462,12 +472,14 @@ function createHub({
         client.blocked = false;
         if (!client.needsSnapshot) return;
         client.needsSnapshot = false;
-        // A skipped frame invalidates both freshness and delta baselines.
+        // Resync to the baseline the last fan-out established, so the next
+        // update resumes with freshness or delta frames, not another snapshot.
         client.streamRevision = null;
         try {
-          writeSseFrame(client, encodeSseEvent('stats', {
-            type: 'stats', reason: 'snapshot', stats: getStats(), at: new Date().toISOString()
-          }));
+          if (writeSseFrame(client, encodeSseEvent('stats', {
+            type: 'stats', reason: 'snapshot', stats: lastSseStats, at: new Date().toISOString(),
+            ...(client.deltaEvents ? { revision: streamRevision } : {})
+          })) && client.deltaEvents) client.streamRevision = streamRevision;
         } catch (_) { client.cleanup(); }
       };
       res.on('close', client.cleanup);
@@ -486,13 +498,20 @@ function createHub({
       return;
     }
 
-    if (req.method === 'POST' && url.pathname === '/api/ingest') {
+    if (req.method === 'POST' && ['/api/ingest', '/api/ingest/delta'].includes(url.pathname)) {
       try {
-        const payload = await readJsonBody(req);
+        const incoming = await readJsonBody(req);
+        const delta = url.pathname === '/api/ingest/delta';
+        const payload = delta ? uploadBaselines.prepare(incoming) : incoming;
         const record = ingestRecord(payload);
-        const response = { ok: true, deviceId: record.deviceId };
+        const upload = delta || req.headers[UPLOAD_HEADER] === UPLOAD_VERSION
+          ? uploadBaselines.commit(record.deviceId, stripSessionTextFromDeviceRecord(payload, {
+              preserveSessionTitles: acceptsSessionTitles(serverTitlesEnabled, store.syncTitlePolicies[record.deviceId], payload.sessionTitleSyncGeneration)
+            })) : undefined;
+        const response = { ok: true, deviceId: record.deviceId, ...(upload ? { upload } : {}) };
         return sendJson(res, 200, wantsMinimalResponse(req) ? response : { ...response, stats: getStats() });
       } catch (error) {
+        if (error.status) return sendJson(res, error.status, { error: error.code });
         if (error.message === 'deviceId_required') return sendJson(res, 400, { error: 'deviceId_required' });
         if (error.code === 'payload_too_large') {
           res.shouldKeepAlive = false;

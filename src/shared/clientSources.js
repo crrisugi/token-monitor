@@ -10,7 +10,7 @@ const { claudeSessionRoots } = require('./providers/claude/paths');
 const { hermesProfileWatchDirs, resolveHermesHome } = require('./providers/hermes/profiles');
 const { kimiCodeSessionsHome, kimiWorkSessionsRoots } = require('./providers/kimi/sessionMetadata');
 const { catpawDataSources, nativeWindowsFolders } = require('./providers/catpaw/paths');
-const { qoderCnDataPaths } = require('./providers/qodercn/paths');
+const { primeAgentSessionRoots } = require('./providers/prime-agent/paths');
 const { MCODE_SOURCE_CHECK_ID, mcodeSessionDirs } = require('./providers/mcode/paths');
 const { resolveReasonixStatsDir, REASONIX_SOURCE_CHECK_ID } = require('./providers/reasonix/paths');
 const { resolveDshSessionsDir, DSH_SOURCE_CHECK_ID } = require('./providers/dsh/paths');
@@ -20,6 +20,7 @@ const {
   devinCliDbDirs,
   devinDesktopAcpDirs
 } = require('./providers/devin/paths');
+const { cursorCacheDir } = require('./providers/cursor/usageEvents');
 const { senpiWatchSources } = require('./providers/senpi/paths');
 
 // Windows only: libuv asserts that the filename ReadDirectoryChangesW hands
@@ -232,10 +233,16 @@ function clientSourceRoots(clientsCsv, options = {}) {
   // at the profile while the scan read the $HOME tree, so Amp could show
   // `detected` next to usage collected from another directory.
   const tokscaleHome = tokscaleHomeDir({ env, platform, homeDir: home });
+  add('jcode', ['jcode-sessions', path.join(nonBlankEnvPath('JCODE_HOME', path.join(tokscaleHome, '.jcode'), env), 'sessions')]);
+  if (enabled.has('prime-agent')) {
+    const [sessions, artifacts] = primeAgentSessionRoots({ homeDir: tokscaleHome, env });
+    add('prime-agent', ['prime-agent-sessions', sessions], ['prime-agent-artifacts', artifacts]);
+  }
   const xdgHome = xdgDataHome(tokscaleHome, env);
   const gooseFiles = enabled.has('goose')
     ? gooseSessionFiles({ homeDir: home, platform, env, windowsFolders: options.windowsFolders }) : [];
   add('goose', ...gooseFiles.map((file) => ['goose-db', path.dirname(file), file]));
+  add('mistral', ['mistral-sessions', path.join(nonBlankEnvPath('VIBE_HOME', path.join(tokscaleHome, '.vibe'), env), 'logs', 'session')]);
   add('opencode', ['opencode-data', path.join(xdgHome, 'opencode')]);
   add('openclaw', ['openclaw-agents', path.join(home, '.openclaw', 'agents')]);
   // The sync cache is config-derived; legacy local threads stay XDG-data
@@ -249,21 +256,16 @@ function clientSourceRoots(clientsCsv, options = {}) {
   // Electron shell over the same bundled droid kernel and keeps no session data
   // of its own, so this one root covers both.
   add('droid', ...simpleHostSourceRoots('droid', home));
-  // Tokscale resolves these two caches differently and the split is deliberate
-  // upstream, so mirror it rather than picking whichever looks tidier:
-  //   cursor.rs      — `home_dir().join(".config/tokscale/cursor-cache")`, a
-  //                    home-relative literal that never consults
-  //                    `get_config_dir()`. On Windows that is
-  //                    `%USERPROFILE%\.config\tokscale\`, not `%APPDATA%\tokscale\`,
-  //                    and TOKSCALE_CONFIG_DIR does not move it.
-  //   antigravity.rs — `paths::get_config_dir().join("antigravity-cache")`,
-  //                    routed that way on purpose so an isolated profile covers
-  //                    the sync cache too.
+  // Both caches honour TOKSCALE_CONFIG_DIR. Cursor defaults to ~/.config/tokscale
+  // on every platform; Antigravity uses the platform-aware tokscaleConfigDir().
   const tokscaleConfigRoot = tokscaleConfigDir({ env, platform, homeDir: home });
-  add('cursor', ['tokscale-cursor-cache', path.join(tokscaleHome, '.config', 'tokscale', 'cursor-cache')]);
+  add('cursor', ['tokscale-cursor-cache', cursorCacheDir({ env, platform, homeDir: home })]);
   add('antigravity',
     ['tokscale-antigravity-cache', path.join(tokscaleConfigRoot, 'antigravity-cache')],
     ['antigravity-extension-data', path.join(home, '.gemini', 'antigravity', 'conversations')]);
+  // Antigravity keeps its own roots under this home; do not watch `.gemini` itself.
+  const geminiHome = nonBlankEnvPath('GEMINI_CLI_HOME', path.join(tokscaleHome, '.gemini'), env);
+  add('gemini', ['gemini-sessions', path.join(geminiHome, 'tmp')]);
   // A whitespace-only KIMI_CODE_HOME counts as unset, matching tokscale: it
   // joins `sessions` onto the raw value, so a blank export would resolve to the
   // root-level /sessions and hide the real one.
@@ -297,9 +299,13 @@ function clientSourceRoots(clientsCsv, options = {}) {
   const copilotOtelRoot = path.join(home, '.copilot', 'otel');
   const copilotRoots = [
     ['copilot-otel', copilotOtelRoot],
+    ['copilot-session-state', path.join(home, '.copilot', 'session-state')],
     ['copilot-data', path.join(home, '.copilot'), path.join(home, '.copilot', 'data.db')],
     ['copilot-session-store', path.join(home, '.copilot'), path.join(home, '.copilot', 'session-store.db')],
-    ...[...new Set(copilotWorkspaceRoots)].map((dir) => ['vscode-workspace-storage', dir])
+    ...[...new Set(copilotWorkspaceRoots)].map((dir) => ['vscode-workspace-storage', dir]),
+    ...[...new Set(copilotWorkspaceRoots)].map((dir) => [
+      'vscode-empty-window-sessions', path.join(path.dirname(dir), 'globalStorage', 'emptyWindowChatSessions')
+    ])
   ];
   // The parent is the watch root because the exporter file may not exist yet;
   // the exact file is the source. watchAttributionRootsForClients() keeps that
@@ -417,14 +423,11 @@ function clientSourceRoots(clientsCsv, options = {}) {
       ...catpaw.dbPaths.map((file) => ['catpaw-db', path.dirname(file), file])
     );
   }
-  // Qoder CN — legacy SQLite DB under the platform Application Support dir,
-  // or the JSONL transcript tree used by current builds.
-  const qoderCnPaths = qoderCnDataPaths({ homeDir: home, platform, env });
-  add(
-    'qodercn',
-    ...qoderCnPaths.dbPaths.map((dbPath) => ['qodercn-db', path.dirname(dbPath), dbPath]),
-    ['qodercn-projects', qoderCnPaths.projectsDir]
-  );
+  add('qoder', ['qoder-projects', path.join(nonBlankEnvPath('QODER_CONFIG_DIR', path.join(tokscaleHome, '.qoder'), env), 'projects')]);
+  const qoderCnConfig = String(env.QODERCN_CONFIG_DIR || '').trim();
+  const qoderCnProjects = String(env.TOKEN_MONITOR_QODER_CN_PROJECTS_PATH || '').trim();
+  add('qodercn', ['qodercn-projects', qoderCnProjects ? path.resolve(qoderCnProjects)
+    : qoderCnConfig ? path.resolve(qoderCnConfig, 'projects') : path.join(tokscaleHome, '.qoder-cn', 'projects')]);
   // MiniMax Code — upstream reads only captured `tokscale headless mcode exec`
   // streams; the fork adds the CLI and desktop runtime store from tokscale's
   // effective home (providers/mcode/paths.js). Only the default `.minimax`
@@ -448,9 +451,9 @@ function clientSourceRoots(clientsCsv, options = {}) {
   // both CLI and IDE, the Kiro IDE globalStorage root (native macOS / Linux /
   // Windows), and the kiro-cli sqlite dir. None falls back to a host-absolute
   // path under --home (unlike Zed), so every root remains a valid source and
-  // presence signal. The globalStorage kind is deliberately interval-only in
-  // clientWatchCandidates() because real trees can contain tens of thousands of
-  // files; the sessions and sqlite roots retain seconds-level refresh.
+  // presence signal. GlobalStorage stays interval-only: the scanner still
+  // traverses its checkpoint/index trees on every scan. The separate sessions
+  // and SQLite roots retain live updates, with session snapshots unwatched.
   //
   // Note the deliberate Kiro-vs-kiro casing asymmetry below (do not "fix" it to
   // list both cases everywhere): tokscale scans both `Kiro` and `kiro` cased

@@ -1,3 +1,4 @@
+import uploadDelta from './shared/uploadDelta.js';
 import { publicLimits } from './shared/limits/core.js';
 import subscriptionDisplay from './shared/subscriptionDisplay.js';
 import currency from './shared/currency.js';
@@ -16,8 +17,12 @@ import hubProtocol from './shared/hubProtocol.js';
 const CORS_HEADERS = {
   'access-control-allow-origin': '*',
   'access-control-allow-methods': 'GET,POST,PUT,DELETE,OPTIONS',
-  'access-control-allow-headers': 'authorization,content-type,x-token-monitor-secret,x-token-monitor-response,x-token-monitor-stream'
+  'access-control-allow-headers': 'authorization,content-type,x-token-monitor-secret,x-token-monitor-response,x-token-monitor-stream,x-token-monitor-upload'
 };
+
+// SQLite Durable Object storage allows 8 MB for the key and its value. Keep
+// headroom for the serializer's per-value overhead.
+const MAX_DEVICE_STORAGE_BYTES = 7 * 1024 * 1024;
 
 function jsonResponse(status, payload, extra = {}, request = null) {
   const body = JSON.stringify(payload);
@@ -37,6 +42,31 @@ function jsonResponse(status, payload, extra = {}, request = null) {
     },
     ...(shouldCompress ? { encodeBody: 'manual' } : {})
   });
+}
+
+// Bound full and delta ingest bytes before JSON materialization, including
+// requests without Content-Length.
+async function readIngestJson(request) {
+  const reader = request.body?.getReader();
+  if (!reader) return JSON.parse('');
+  const chunks = [];
+  let bytes = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > uploadDelta.MAX_UPLOAD_BYTES) {
+        await reader.cancel();
+        throw Object.assign(new Error('payload_too_large'), { status: 413 });
+      }
+      chunks.push(value);
+    }
+  } finally { reader.releaseLock(); }
+  const body = new Uint8Array(bytes);
+  let offset = 0;
+  for (const chunk of chunks) { body.set(chunk, offset); offset += chunk.byteLength; }
+  return JSON.parse(new TextDecoder().decode(body));
 }
 
 function textResponse(status, body, contentType = 'text/plain; charset=utf-8') {
@@ -92,6 +122,7 @@ export default {
 export class HubDO {
   constructor(state, env) {
     this.state = state;
+    this.uploadBaselines = uploadDelta.createUploadBaselines();
     this.env = env;
     this.sseClients = new Set();
     this.heartbeatTimer = null;
@@ -139,6 +170,7 @@ export class HubDO {
   }
 
   async cleanTitlePrivacy() {
+    this.uploadBaselines.clear();
     const enabled = this.syncSessionTitles;
     await this.withStorageTransaction(async (storage) => {
       const policies = await storage.list({ prefix: TITLE_POLICY_PREFIX });
@@ -204,6 +236,7 @@ export class HubDO {
       const previous = await storage.get(key);
       const next = syncContent.nextTitlePolicy(previous, enabled);
       if (enabled && syncContent.normalizeTitlePolicy(previous).enabled) return next;
+      this.uploadBaselines.forget(deviceId);
       await storage.put(key, next);
       if (!enabled) {
         const record = await storage.get(`dev:${deviceId}`);
@@ -273,24 +306,36 @@ export class HubDO {
 
   ensureHeartbeat() {
     if (this.heartbeatTimer || this.sseClients.size === 0) return;
-    this.heartbeatTimer = setInterval(() => {
-      const chunk = this.encoder.encode(': hb\n\n');
-      for (const client of this.sseClients) {
-        if (!client.busy) this.writeEncoded(client, chunk);
-      }
-      if (this.sseClients.size === 0 && this.heartbeatTimer) {
-        clearInterval(this.heartbeatTimer);
-        this.heartbeatTimer = null;
+    let pending = false;
+    this.heartbeatTimer = setInterval(async () => {
+      if (pending) return;
+      pending = true;
+      const generation = this.sseGeneration;
+      try {
+        // A replaced DO can keep its old timer/response alive without receiving
+        // new ingests. Storage access checks ownership before a heartbeat can
+        // keep those orphaned streams looking healthy. This key is never written.
+        await this.state.storage.get('sse-liveness', { noCache: true });
+        if (generation !== this.sseGeneration) return;
+        const chunk = this.encoder.encode(': hb\n\n');
+        for (const client of this.sseClients) {
+          if (!client.pendingBytes) this.writeEncoded(client, chunk);
+        }
+      } catch (error) {
+        if (generation === this.sseGeneration) {
+          for (const client of this.sseClients) this.dropClient(client, error);
+        }
+      } finally {
+        pending = false;
       }
     }, 30000);
   }
 
-  dropClient(client) {
+  dropClient(client, error = null) {
     this.sseClients.delete(client);
     client.onDrop?.();
     try {
-      const stop = client.writer.close;
-      Promise.resolve(stop?.call(client.writer)).catch(() => {});
+      Promise.resolve(error ? client.writer.abort?.(error) : client.writer.close?.()).catch(() => {});
     } catch (_) {}
     if (this.sseClients.size === 0 && this.heartbeatTimer) {
       clearInterval(this.heartbeatTimer);
@@ -307,30 +352,33 @@ export class HubDO {
     }
   }
 
+  // Same bound as the Node Hub: frames queue in order behind the write in
+  // flight up to SSE_BACKLOG_LIMIT_BYTES of unresolved writes; past that, the
+  // connection skips frames and resyncs once every accepted write has settled.
   writeEncoded(client, chunk) {
     if (!this.sseClients.has(client)) return false;
-    if (client.busy) {
+    const pendingBytes = client.pendingBytes || 0;
+    if (pendingBytes && (client.needsSnapshot || pendingBytes + chunk.byteLength > client.backlogLimit)) {
       client.needsSnapshot = true;
       return false;
     }
-    client.busy = true;
+    if (!pendingBytes) client.backlogLimit = chunk.byteLength + hubProtocol.SSE_BACKLOG_LIMIT_BYTES;
+    client.pendingBytes = pendingBytes + chunk.byteLength;
     let write;
     try { write = client.writer.write(chunk); }
     catch (_) { this.dropClient(client); return false; }
-    Promise.resolve(write).then(async () => {
+    Promise.resolve(write).then(() => {
       if (!this.sseClients.has(client)) return;
-      if (!client.needsSnapshot) { client.busy = false; return; }
-      // No queued frames: the pending write plus one dirty bit bounds memory.
-      // Keep busy during the read, so a concurrent broadcast cannot overtake it.
+      client.pendingBytes -= chunk.byteLength;
+      if (client.pendingBytes || !client.needsSnapshot) return;
       client.needsSnapshot = false;
+      // Resync to the baseline the last fan-out established, so the next
+      // update resumes with freshness or delta frames, not another snapshot.
       client.streamRevision = null;
-      const stats = await this.statsWithSubscriptionVersion();
-      if (!this.sseClients.has(client)) return;
-      client.busy = false;
-      this.writeEncoded(client, this.encoder.encode(hubProtocol.encodeSseEvent('stats', {
-        type: 'stats', reason: 'snapshot', stats, at: new Date().toISOString(),
-        ...(Number.isSafeInteger(client.streamRevision) ? { revision: client.streamRevision } : {})
-      })));
+      if (this.writeEncoded(client, this.encoder.encode(hubProtocol.encodeSseEvent('stats', {
+        type: 'stats', reason: 'snapshot', stats: this.lastSseStats, at: new Date().toISOString(),
+        ...(client.deltaEvents ? { revision: this.streamRevision } : {})
+      }))) && client.deltaEvents) client.streamRevision = this.streamRevision;
     }, () => this.dropClient(client)).catch(() => this.dropClient(client));
     return true;
   }
@@ -530,23 +578,45 @@ export class HubDO {
       });
     }
 
-    if (request.method === 'POST' && url.pathname === '/api/ingest') {
+    if (request.method === 'POST' && ['/api/ingest', '/api/ingest/delta'].includes(url.pathname)) {
+      const delta = url.pathname === '/api/ingest/delta';
       let payload;
-      try { payload = await request.json(); }
-      catch (error) { return jsonResponse(400, { error: 'bad_request', message: error.message }); }
-      if (!payload || (!payload.deviceId && !payload.id)) return jsonResponse(400, { error: 'deviceId_required' });
-      const deviceId = String(payload.deviceId || payload.id);
-      const record = await this.mutate(async () => {
-        const policy = await this.state.storage.get(`${TITLE_POLICY_PREFIX}${deviceId}`);
-        const existing = await this.state.storage.get(`dev:${deviceId}`);
-        const next = mergeSyncDeviceRecord(existing, { ...payload, receivedAt: new Date().toISOString() }, {
-          preserveSessionTitles: syncContent.acceptsSessionTitles(this.syncSessionTitles, policy, payload.sessionTitleSyncGeneration)
+      try { payload = await readIngestJson(request); }
+      catch (error) {
+        return jsonResponse(error.status === 413 ? 413 : 400, {
+          error: error.status === 413 ? 'payload_too_large' : 'bad_request', message: error.message
         });
-        await this.state.storage.put(`dev:${next.deviceId}`, next);
-        return next;
-      });
+      }
+      let record, upload;
+      try {
+        record = await this.mutate(async () => {
+          const incoming = delta ? this.uploadBaselines.prepare(payload) : payload;
+          if (!incoming || (!incoming.deviceId && !incoming.id)) throw Object.assign(new Error('deviceId_required'), { status: 400, code: 'deviceId_required' });
+          const deviceId = String(incoming.deviceId || incoming.id);
+          const policy = await this.state.storage.get(`${TITLE_POLICY_PREFIX}${deviceId}`);
+          const existing = await this.state.storage.get(`dev:${deviceId}`);
+          const preserveSessionTitles = syncContent.acceptsSessionTitles(this.syncSessionTitles, policy, incoming.sessionTitleSyncGeneration);
+          const next = mergeSyncDeviceRecord(existing, { ...incoming, receivedAt: new Date().toISOString() }, { preserveSessionTitles });
+          const storageKey = `dev:${next.deviceId}`;
+          const encoder = new TextEncoder();
+          const storageBytes = encoder.encode(storageKey).byteLength
+            + encoder.encode(JSON.stringify(next)).byteLength;
+          if (storageBytes > MAX_DEVICE_STORAGE_BYTES) {
+            throw Object.assign(new Error('payload_too_large'), { status: 413, code: 'payload_too_large' });
+          }
+          await this.state.storage.put(storageKey, next);
+          this.uploadBaselines.forget(deviceId);
+          if (delta || request.headers.get(uploadDelta.UPLOAD_HEADER) === uploadDelta.UPLOAD_VERSION) {
+            upload = this.uploadBaselines.commit(deviceId, stripSessionTextFromDeviceRecord(incoming, { preserveSessionTitles }));
+          }
+          return next;
+        });
+      } catch (error) {
+        if (error.status) return jsonResponse(error.status, { error: error.code });
+        throw error;
+      }
       this.queueBroadcast();
-      const response = { ok: true, deviceId: record.deviceId };
+      const response = { ok: true, deviceId: record.deviceId, ...(upload ? { upload } : {}) };
       return jsonResponse(
         200,
         hubProtocol.wantsMinimalResponse(request)
@@ -613,6 +683,7 @@ export class HubDO {
     if (request.method === 'DELETE' && url.pathname.startsWith('/api/devices/')) {
       const deviceId = decodeURIComponent(url.pathname.slice('/api/devices/'.length));
       await this.mutate(() => this.withStorageTransaction(async (storage) => {
+        this.uploadBaselines.forget(deviceId);
         const key = `${TITLE_POLICY_PREFIX}${deviceId}`;
         await storage.put(key, syncContent.nextTitlePolicy(await storage.get(key), false));
         await storage.delete(`dev:${deviceId}`);
